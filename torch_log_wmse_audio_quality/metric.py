@@ -11,37 +11,47 @@ from torch_log_wmse_audio_quality.freq_weighting_filter import HumanHearingSensi
 from torch_log_wmse_audio_quality.utils import calculate_rms
 
 
-class LogWMSELoss(torch.nn.Module):
+class LogWMSE(torch.nn.Module):
     """
-    A custom audio metric, logWMSE, that tries to fix a few shortcomings of common metrics.
-    The most important property is the support for digital silence in the target, which
-    (SI-)SDR, SIR, SAR, ISR, VISQOL_audio, STOI, CDPAM and VISQOL do not support.
+    logWMSE is a custom metric and loss function for audio signals that calculates the logarithm
+    of a frequency-weighted Mean Squared Error (MSE). It is designed to address several shortcomings 
+    of common audio metrics, most importantly the lack of support for digital silence targets.
 
-    MSE is well-defined for digital silence targets, but has a bunch of other issues:
-    * The values are commonly ridiculously small, like between 1e-8 and 1e-3, which
-        makes number formatting and sight-reading hard
-    * It's not tailored for audio
-    * It's not scale-invariant
-    * It doesn't align with frequency sensitivity of human hearing
-    * It's not invariant to tiny errors that don't matter because humans can't hear
-        those errors anyway
-    * It's not logarithmic, like human hearing is
+    Key features of logWMSE:
+    * Supports digital silence targets not supported by other audio metrics.
+        i.e. (SI-)SDR, SIR, SAR, ISR, VISQOL_audio, STOI, CDPAM, and VISQOL.
+    * Overcomes the small value range issue of MSE (i.e. between 1e-8 and 1e-3), making number 
+        formatting and sight-reading easier. Scaled similar to SI-SDR.
+    * Scale-invariant, aligns with the frequency sensitivity of human hearing.
+    * Invariant to the tiny errors of MSE that are inaudible to humans.
+    * Logarithmic, reflecting the logarithmic sensitivity of human hearing.
+    * Tailored specifically for audio signals.
 
-    So this custom metric attempts to solve all the problems mentioned above.
-    It's essentially the log of a frequency-weighted MSE, with a few bells and whistles.
+    Args:
+        audio_length (int): The length of the audio signal in seconds.
+        sample_rate (int, optional): The sample rate of the audio signal in Hz. Defaults to 44100.
+        impulse_response (Tensor, optional): The finite impulse response (FIR) filter for 
+            frequency weighting. If None (default), use built-in FIR. Currently only supports
+            single-channel FIRs (applied to all batches & audio channels).
+        impulse_response_sample_rate (int, optional): The sample rate of the FIR in Hz. Defaults to 44100.
+        return_as_loss (bool, optional): Whether to return the loss value. Defaults to True.
     """
     def __init__(
             self,
+            audio_length: int,
             sample_rate: int = 44100,
             impulse_response: Optional[Tensor] = None,
-            impulse_response_sample_rate: int = 44100
+            impulse_response_sample_rate: int = 44100,
+            return_as_loss: bool = True,
         ):
         super().__init__()
         self.filters = HumanHearingSensitivityFilter(
+            audio_length=audio_length,
             sample_rate=sample_rate,
             impulse_response=impulse_response,
             impulse_response_sample_rate=impulse_response_sample_rate
         )
+        self.return_as_loss = return_as_loss
 
     def forward(self, unprocessed_audio: Tensor, processed_audio: Tensor, target_audio: Tensor):
         assert unprocessed_audio.ndim == 3 # unprocessed_audio audio shape: [batch, channel, time]
@@ -52,6 +62,11 @@ class LogWMSELoss(torch.nn.Module):
 
         input_rms = calculate_rms(self.filters(unprocessed_audio.unsqueeze(2))) # unsqueeze to add "stem" dimension
 
+        # Avoid log(0)
+        if input_rms.sum() == 0:
+            return torch.log(torch.tensor(EPS)) * SCALER
+
+        # Calculate the logWMSE
         values = self._calculate_log_wmse(
             input_rms,
             self.filters,
@@ -59,7 +74,10 @@ class LogWMSELoss(torch.nn.Module):
             target_audio,
         )
 
-        return torch.mean(values)
+        if self.return_as_loss:
+            return -torch.mean(values)
+        else:
+            return torch.mean(values)
 
     @staticmethod
     def _calculate_log_wmse(
@@ -68,8 +86,20 @@ class LogWMSELoss(torch.nn.Module):
         processed_audio: Tensor,
         target_audio: Tensor,
     ):
-        zero_mask = torch.sum(input_rms, dim=-1, keepdim=True) == 0
-        scaling_factor = torch.where(zero_mask, torch.zeros_like(input_rms), 1 / input_rms)
+        """
+        Calculate the logWMSE between the processed audio and target audio.
+
+        Args:
+            input_rms (Tensor): The root mean square of the input audio.
+            filters (Callable): A function that applies a filter to the audio (i.e. HumanHearingSensitivityFilter).
+            processed_audio (Tensor): The processed audio tensor.
+            target_audio (Tensor): The target audio tensor.
+
+        Returns:
+            Tensor: The logWMSE between the processed audio and target audio.
+        """
+        # Calculate the scaling factor based on the input RMS
+        scaling_factor = 1 / input_rms
 
         # Add extra dimensions to scaling_factor to match the shape of processed_audio and target_audio
         while scaling_factor.dim() < processed_audio.dim():
@@ -78,11 +108,11 @@ class LogWMSELoss(torch.nn.Module):
         # Expand scaling_factor to match the shape of processed_audio and target_audio
         scaling_factor = scaling_factor.expand(*processed_audio.shape)
 
-        # TODO: scaling factor is shape [2, 2]. each value needs to be multiplied to all corresponding calues for [i, i, :, :]
+        # Calculate the frequency-weighted differences, ignoring small imperceptible differences
         differences = filters(processed_audio * scaling_factor) - filters(target_audio * scaling_factor)
-
         differences[torch.abs(differences) < ERROR_TOLERANCE_THRESHOLD] = 0.0
-        mean_diff = (differences**2).mean(dim=-1)
-        zero_mask = (mean_diff == 0)
 
-        return torch.where(zero_mask, torch.log(torch.tensor(EPS)) * SCALER, torch.log((differences**2).mean(dim=-1) + EPS) * SCALER)
+        # Calculate the mean squared differences
+        mean_diff = (differences**2).mean(dim=-1)
+
+        return torch.log(mean_diff + EPS) * SCALER
