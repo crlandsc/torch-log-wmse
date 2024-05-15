@@ -12,14 +12,7 @@ of a frequency-weighted (W) Mean Squared Error (MSE). It is designed to address 
 [![PyPI - Python Version](https://img.shields.io/pypi/pyversions/torch-log-wmse-audio-quality)](https://pypi.org/project/torch-log-wmse-audio-quality/) [![PyPI - Version](https://img.shields.io/pypi/v/torch-log-wmse-audio-quality)](https://pypi.org/project/torch-log-wmse-audio-quality/) [![Number of downloads from PyPI per month](https://img.shields.io/pypi/dm/torch-log-wmse-audio-quality)](https://pypi.org/project/torch-log-wmse-audio-quality/)
 
 
-
-To use this repository, clone it and install the required dependencies:
-
-```bash
-git clone https://github.com/your-username/torch-log-wmse-audio-quality.git
-cd torch-log-wmse-audio-quality
-pip install -r requirements.txt
-```
+`pip install torch-log-wmse-audio-quality`
 
 ## Usage Example
 
