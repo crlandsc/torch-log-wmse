@@ -12,7 +12,7 @@ def calculate_rms(samples: torch.Tensor):
 def convert_decibels_to_amplitude_ratio(decibels: Union[torch.Tensor, float]):
     """
     Converts a tensor of decibel values into a tensor of amplitude ratios.
-        Args: decibels (torch.Tensor): A tensor containing decibel values.
+        Args: decibels (Union[torch.Tensor, float]): A tensor containing decibel values.
         Returns: torch.Tensor: A tensor of the same shape as the input, but containing amplitude ratio values.
     """
     if not isinstance(decibels, torch.Tensor):
