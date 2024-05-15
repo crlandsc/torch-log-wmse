@@ -1,11 +1,17 @@
 # torch-log-wmse-audio-quality
 
+![LICENSE](https://img.shields.io/github/license/crlandsc/torch-log-wmse-audio-quality) ![GitHub Repo stars](https://img.shields.io/github/stars/crlandsc/torch-log-wmse-audio-quality) ![GitHub forks](https://img.shields.io/github/forks/crlandsc/torch-log-wmse-audio-quality)
+
 This repository contains the torch implementation of an audio quality metric, [logWMSE](https://github.com/nomonosound/log-wmse-audio-quality), originally suggested by [Iver Jordal](https://github.com/iver56) of [Nomono](https://nomono.co/). In addition to the original metric, this implementation can also be used as a loss function for training audio models.
 
 logWMSE is a custom metric and loss function for audio signals that calculates the logarithm (log)
 of a frequency-weighted (W) Mean Squared Error (MSE). It is designed to address several shortcomings of common audio metrics, most importantly the lack of support for digital silence targets.
 
 ## Installation
+
+![PyPI - Python Version](https://img.shields.io/pypi/pyversions/torch-log-wmse-audio-quality) ![PyPI - Version](https://img.shields.io/pypi/v/torch-log-wmse-audio-quality) ![Number of downloads from PyPI per month](https://img.shields.io/pypi/dm/torch-log-wmse-audio-quality)
+
+
 
 To use this repository, clone it and install the required dependencies:
 
