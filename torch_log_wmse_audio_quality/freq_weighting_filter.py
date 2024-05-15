@@ -1,51 +1,81 @@
 import torch
-import torch.fft
 from torch import Tensor
 from torchaudio.transforms import Resample
 import importlib.resources as resources
 import pickle
+import math
 
-# # imports for conv1d implementation
-# from einops import rearrange, repeat
-# from torch.nn.functional import conv1d
 
-def fft_convolve(audio, impulse_response):
-    # Move the impulse response to the same device as the audio
-    impulse_response = impulse_response.to(audio.device)
+def prepare_impulse_response_fft(impulse_response, fft_size):
+    """
+    Prepares the FFT of the impulse response for convolution.
 
-    # Flatten the batch, channel, and stem dimensions
-    original_shape = audio.shape
-    flattened_audio = audio.reshape(-1, original_shape[-1])
-    
-    # Initialize an output tensor
-    convolved_audio = torch.empty_like(flattened_audio)
-    
-    # Apply FFT convolution to each sequence
-    for i in range(flattened_audio.shape[0]):
-        signal_fft = torch.fft.rfft(flattened_audio[i], n=flattened_audio.shape[-1] + impulse_response.size(-1) - 1)
-        impulse_response_fft = torch.fft.rfft(impulse_response, n=flattened_audio.shape[-1] + impulse_response.size(-1) - 1)
-        result_fft = signal_fft * impulse_response_fft
-        result = torch.fft.irfft(result_fft, n=flattened_audio.shape[-1] + impulse_response.size(-1) - 1)
-        
-        # Trim the result to match the original signal length
-        start = impulse_response.size(-1) // 2
-        end = start + original_shape[-1]
-        convolved_audio[i] = result[start:end]
-    
-    # Reshape the convolved audio back to the original shape
-    convolved_audio = convolved_audio.reshape(original_shape)
-    
+    Parameters:
+    - impulse_response: The impulse response signal, a 1D tensor of shape [kernel_size].
+    - fft_size: The size of FFT to use, typically a power of two that is at least
+                as large as the sum of the signal length and kernel_size minus one.
+
+    Returns:
+    - A 2D tensor of shape [1, 1, fft_size // 2 + 1] representing the FFT of the impulse
+      response, ready for broadcasting across batches and channels during convolution.
+    """
+    # Pad the impulse response to FFT size (N+M-1)
+    total_padding = fft_size - impulse_response.shape[0]
+    left_padding = total_padding // 2
+    right_padding = total_padding - left_padding
+    impulse_response = torch.nn.functional.pad(impulse_response, (left_padding, right_padding))
+
+    # Compute the FFT of the impulse response
+    impulse_response_fft = torch.fft.rfft(impulse_response, n=fft_size)
+
+    # Adjust shape for broadcasting across batches, channels, & stems
+    impulse_response_fft = impulse_response_fft.unsqueeze(0).unsqueeze(0)
+
+    return impulse_response_fft
+
+
+def fft_convolve(audio_batch, impulse_response_fft, fft_size):
+    """
+    Performs FFT convolution on a batch of audio signals using a precomputed impulse response FFT.
+
+    Parameters:
+    - audio_batch: A batch of audio signals, with shape [batch_size, channels, signal_length].
+    - impulse_response_fft: The precomputed FFT of the impulse response, with shape [1, 1, fft_size // 2 + 1].
+
+    Returns:
+    - A tensor of convolved audio signals with the same shape as audio_batch.
+    """
+    # Perform the FFT on the audio batch
+    signal_fft = torch.fft.rfft(audio_batch, n=fft_size)
+
+    # Apply the convolution in the frequency domain
+    result_fft = signal_fft * impulse_response_fft
+
+    # Perform the inverse FFT to obtain the convolved signals
+    convolved_audio = torch.fft.irfft(result_fft, n=fft_size)
+
     return convolved_audio
 
 
 class HumanHearingSensitivityFilter:
-    def __init__(self, sample_rate: int = 44100, impulse_response: Tensor = None, impulse_response_sample_rate: int = 44100):
+    """
+    A filter that applies human hearing sensitivity weighting to audio signals.
+    
+    This class implements a frequency weighting filter that mimics human hearing sensitivity. 
+    It uses predefined finite impulse responses (FIR) to simulate how human ears perceive different frequencies.
+    
+    Attributes:
+        sample_rate (int): The sample rate of the audio signal.
+        impulse_response (torch.Tensor): The FIR used for filtering.
+        impulse_response_fft (torch.Tensor): The FFT of the impulse response used for efficient convolution.
+    """
+    def __init__(self, audio_length: int = 1, sample_rate: int = 44100, impulse_response: Tensor = None, impulse_response_sample_rate: int = 44100):
         # Load the impulse response if not provided
         if impulse_response is None:
             with resources.open_binary("torch_log_wmse_audio_quality", "filter_ir.pkl") as f:
                 impulse_response = torch.tensor(pickle.load(f), dtype=torch.float32)
 
-        # Move impulse response to available device - also dynamically set during fft_convolve
+        # Move impulse response to available cude if available - also dynamically set during fft_convolve
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         impulse_response = impulse_response.to(device=device)
 
@@ -54,36 +84,48 @@ class HumanHearingSensitivityFilter:
             self.resampler = Resample(orig_freq=impulse_response_sample_rate, new_freq=sample_rate)
             impulse_response = self.resampler(impulse_response)
 
-        # Adjust impulse response to match the expected dimensions for conv1d
-        self.impulse_response = impulse_response.squeeze() #.unsqueeze(0)  # Add a batch dimension for grouped convolution
+        # Remove any singleton dimensions
+        self.impulse_response = impulse_response.squeeze()
+
+        # Calculate minimum FFT size (N+M-1) - make a power of 2 for FFT efficiency
+        self.audio_length_samples = math.floor(audio_length * sample_rate)
+        min_fft_size = self.audio_length_samples + impulse_response.shape[-1] - 1
+        self.fft_size = 2 ** math.ceil(math.log2(min_fft_size))
+
+        # Compute the FFT of the impulse response
+        self.impulse_response_fft = prepare_impulse_response_fft(impulse_response, self.fft_size)
+
 
     def __call__(self, audio: Tensor) -> Tensor:
-        '''
-        Apply the filter to the given audio. The sample rate of the audio
-        '''
+        """
+        Applies the human hearing sensitivity filter to the input audio via frequency domain convolution.
+
+        NOTE: The original logWMSE metric implementation in numpy used time-domain convolution for
+              single-channel/single-batch/single-stem audio. This torch implementation uses FFT convolution
+              for efficiency. This will result in slightly different outputs due to the different convolution
+              methods.
+        
+        Args: audio (torch.Tensor): A tensor containing the audio signal to be filtered. 
+                                    Expected shape is [batch, channels, stem, time].
+        
+        Returns: torch.Tensor: The filtered audio signal with the same shape as the input.
+        """
         # Ensure audio has the correct dimensions: [batch, channels, stem, time]
         if audio.ndim != 4:
             raise ValueError("Audio input must have dimensions [batch, channels, stem, time].")
 
+        # Move impulse response to audio device if necessary
+        if self.impulse_response_fft.device != audio.device:
+            self.impulse_response_fft = self.impulse_response_fft.to(audio.device)
+
+        # Pad audio to match padded FFT size (N+M-1)
+        audio = torch.nn.functional.pad(audio, (0, self.fft_size - audio.shape[-1]))
+
         # Apply FFT convolution
-        # Originally implemented conv1d, but FFT convolution is more efficient with kernel size of 4000
-        filtered_audio = fft_convolve(audio, self.impulse_response)
+        filtered_audio = fft_convolve(audio, self.impulse_response_fft, self.fft_size)
 
-        # # torch convolution with conv1d - deprecated
-        # # Use einops to reshape audio by combining batch and channels dimensions
-        # einops:
-        # # - b: batch
-        # # - c: channels
-        # # - s: stem
-        # # - t: time
-        # audio_reshaped = rearrange(audio, 'b c s t -> (b c) s t')
+        # Trim the filtered audio to match the original length
+        start_index = self.fft_size // 2
+        end_index = start_index + self.audio_length_samples
 
-        # # Apply grouped convolution
-        # impulse_response_repeated = repeat(self.impulse_response, '1 t -> s1 s2 t', s1=audio.shape[2], s2=audio.shape[2])
-        # padding_size = self.impulse_response.shape[-1] // 2
-        # filtered_audio = conv1d(audio_reshaped, impulse_response_repeated, padding=padding_size)[..., :audio.shape[-1]]
-
-        # # Use einops to reshape back to original dimensions: [batch, channels, stem, time]
-        # filtered_audio = rearrange(filtered_audio, '(b c) s t -> b c s t', b=audio.shape[0], c=audio.shape[1])
-
-        return filtered_audio
+        return filtered_audio[..., start_index:end_index]
