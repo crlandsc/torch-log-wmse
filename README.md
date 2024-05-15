@@ -27,8 +27,8 @@ audio_channels = 2 # stereo
 audio_stems = 3 # 3 audio stems
 batch = 4 # batch size
 
-# Instantiate logWMSELoss
-log_wmse_loss = LogWMSE(audio_length=audio_length, sample_rate=sample_rate, return_as_loss=True)
+# Instantiate logWMSE
+log_wmse = LogWMSE(audio_length=audio_length, sample_rate=sample_rate, return_as_loss=True)
 
 # Generate random inputs (scale between -1 and 1)
 audio_lengths_samples = int(audio_length * sample_rate)
@@ -36,7 +36,7 @@ unprocessed_audio = 2 * torch.rand(batch, audio_channels, audio_lengths_samples)
 processed_audio = unprocessed_audio.unsqueeze(2).expand(-1, -1, audio_stems, -1) * 0.1
 target_audio = torch.zeros(batch, audio_channels, audio_stems, audio_lengths_samples)
 
-log_wmse = log_wmse_loss(unprocessed_audio, processed_audio, target_audio)
+log_wmse = log_wmse(unprocessed_audio, processed_audio, target_audio)
 print(log_wmse)  # Expected output: approx. -18.42
 ```
 
