@@ -75,10 +75,6 @@ class HumanHearingSensitivityFilter:
             with resources.open_binary("torch_log_wmse_audio_quality", "filter_ir.pkl") as f:
                 impulse_response = torch.tensor(pickle.load(f), dtype=torch.float32)
 
-        # Move impulse response to available cude if available - also dynamically set during fft_convolve
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        impulse_response = impulse_response.to(device=device)
-
         # Resample the impulse response if necessary
         if impulse_response_sample_rate != sample_rate:
             self.resampler = Resample(orig_freq=impulse_response_sample_rate, new_freq=sample_rate)
