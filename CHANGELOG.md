@@ -13,3 +13,8 @@ Removed device assignment that was causing errors on distributed training setups
 
 #### Bug Fix
 Error in tensor shapes. Was processing as the incorrect [batch, channels, stem, samples] instead of the correct [batch, stem, channels, samples] in some places.
+
+## 0.1.3 (2024-05-16)
+
+#### Include Image
+Moved frequency weighting image to be included in the package.
