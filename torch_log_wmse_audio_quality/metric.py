@@ -34,7 +34,7 @@ class LogWMSE(torch.nn.Module):
             frequency weighting. If None (default), use built-in FIR. Currently only supports
             single-channel FIRs (applied to all batches & audio channels).
         impulse_response_sample_rate (int, optional): The sample rate of the FIR in Hz. Defaults to 44100.
-        return_as_loss (bool, optional): Whether to return the loss value. Defaults to True.
+        return_as_loss (bool, optional): Whether to return the loss value (i.e. negative of the metric). Defaults to True.
     """
     def __init__(
             self,
@@ -60,7 +60,7 @@ class LogWMSE(torch.nn.Module):
         assert processed_audio.shape == target_audio.shape # processed_audio and target_audio should have the same shape
         assert processed_audio.shape[-1] == target_audio.shape[-1] == unprocessed_audio.shape[-1] # all should have the same length
 
-        input_rms = calculate_rms(self.filters(unprocessed_audio.unsqueeze(2))) # unsqueeze to add "stem" dimension
+        input_rms = calculate_rms(self.filters(unprocessed_audio.unsqueeze(1))) # unsqueeze to add "stem" dimension
 
         # Avoid log(0)
         if input_rms.sum() == 0:
@@ -102,6 +102,8 @@ class LogWMSE(torch.nn.Module):
         scaling_factor = 1 / input_rms
 
         # Add extra dimensions to scaling_factor to match the shape of processed_audio and target_audio
+        if scaling_factor.dim() == 2:
+            scaling_factor = scaling_factor.unsqueeze(1)
         while scaling_factor.dim() < processed_audio.dim():
             scaling_factor = scaling_factor.unsqueeze(-1)
 

@@ -25,8 +25,8 @@ class TestLogWMSELoss(unittest.TestCase):
     def test_calculate_log_wmse(self):
         log_wmse_loss = LogWMSE(audio_length=1.0, sample_rate=44100)
         input_rms = torch.ones(2, 2)
-        processed_audio = torch.ones(2, 2, 3, 44100)
-        target_audio = torch.ones(2, 2, 3, 44100)
+        processed_audio = torch.ones(2, 3, 2, 44100)
+        target_audio = torch.ones(2, 3, 2, 44100)
 
         values = log_wmse_loss._calculate_log_wmse(
             input_rms,
@@ -36,7 +36,7 @@ class TestLogWMSELoss(unittest.TestCase):
         )
 
         self.assertIsInstance(values, torch.Tensor)
-        self.assertEqual(values.shape, (2, 2, 3))
+        self.assertEqual(values.shape, (2, 3, 2))
 
         print(f"Values: {values}")
 
@@ -56,8 +56,8 @@ class TestLogWMSELoss(unittest.TestCase):
                     # Generate random inputs (scale between -1 and 1)
                     audio_lengths_samples = int(audio_length * sample_rate)
                     unprocessed_audio = 2 * torch.rand(batch, audio_channels, audio_lengths_samples) - 1
-                    processed_audio = unprocessed_audio.unsqueeze(2).expand(-1, -1, audio_stems, -1) * 0.1
-                    target_audio = torch.zeros(batch, audio_channels, audio_stems, audio_lengths_samples)
+                    processed_audio = unprocessed_audio.unsqueeze(1).expand(-1, audio_stems, -1, -1) * 0.1
+                    target_audio = torch.zeros(batch, audio_stems, audio_channels, audio_lengths_samples)
 
                     loss = log_wmse_loss(unprocessed_audio, processed_audio, target_audio)
 
@@ -79,8 +79,8 @@ class TestLogWMSELoss(unittest.TestCase):
                     # Generate random inputs
                     audio_lengths_samples = int(audio_length * 44100)
                     unprocessed_audio = torch.from_numpy(np.random.rand(2, audio_lengths_samples).astype(np.float32))[None, ...]
-                    processed_audio = torch.from_numpy(np.random.rand(2, audio_lengths_samples).astype(np.float32))[None, :, None, ...].repeat(1, 1, 4, 1)
-                    target_audio = torch.from_numpy(np.random.rand(2, audio_lengths_samples).astype(np.float32))[None, :, None, ...].repeat(1, 1, 4, 1)
+                    processed_audio = torch.from_numpy(np.random.rand(2, audio_lengths_samples).astype(np.float32))[None, None, ...].repeat(1, 4, 1, 1)
+                    target_audio = torch.from_numpy(np.random.rand(2, audio_lengths_samples).astype(np.float32))[None, None, ...].repeat(1, 4, 1, 1)
 
                     loss = log_wmse_loss(unprocessed_audio, processed_audio, target_audio)
 

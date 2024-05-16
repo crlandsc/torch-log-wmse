@@ -102,13 +102,13 @@ class HumanHearingSensitivityFilter:
               methods.
         
         Args: audio (torch.Tensor): A tensor containing the audio signal to be filtered. 
-                                    Expected shape is [batch, channels, stem, time].
+                                    Expected shape is [batch, stem, channels, time].
         
         Returns: torch.Tensor: The filtered audio signal with the same shape as the input.
         """
-        # Ensure audio has the correct dimensions: [batch, channels, stem, time]
+        # Ensure audio has the correct dimensions: [batch, stem, channels, time]
         if audio.ndim != 4:
-            raise ValueError("Audio input must have dimensions [batch, channels, stem, time].")
+            raise ValueError("Audio input must have dimensions [batch, stem, channels, time].")
 
         # Move impulse response to audio device if necessary
         if self.impulse_response_fft.device != audio.device:
