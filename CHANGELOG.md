@@ -18,3 +18,8 @@ Error in tensor shapes. Was processing as the incorrect [batch, channels, stem, 
 
 #### Include Image
 Moved frequency weighting image to be included in the package.
+
+## 0.1.4 (2024-05-16)
+
+#### Image Bug
+Moving image again and correcting reference.

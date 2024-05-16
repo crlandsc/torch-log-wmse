@@ -65,9 +65,9 @@ The goal of this metric is to account for several factors not present in current
 ##### Frequency Weighting
 To measure the frequencies of a signal closer to that of human hearing, the following frequency weighting is applied. This helps the model effectively pay less attention to errors at frequencies that humans are not sensitive to (e.g. 50 Hz) and give more weight to those that we are acutely tuned to (e.g. 3kHz).
 
-![Frequency Weighting](torch_log_wmse_audio_quality/images/frequency_weighting.png)
+![Frequency Weighting](https://raw.githubusercontent.com/crlandsc/torch-log-wmse-audio-quality/main/images/frequency_weighting.png)
 
-This metric has been constructed with high fidelity audio in mind (sample rates &ge; 44.1kHz). It theoretically could work for lower sample rates, like 16kHz, but the metric performs an internal resampling to 44.1kHz for consistency across any input sample rates.
+This metric has been constructed with high-fidelity audio in mind (sample rates &ge; 44.1kHz). It theoretically could work for lower sample rates, like 16kHz, but the metric performs an internal resampling to 44.1kHz for consistency across any input sample rates.
 
 ##### Inputs
 Unlike many audio quality metrics, logWMSE accepts 3 audio inputs rather than 2:
@@ -95,5 +95,5 @@ Contributions are welcome! Please open an issue or submit a pull request if you 
 This project is licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
 
 
-## Acknowledgements
+## Acknowledgments
 Thanks to [Whitebalance](https://www.whitebalance.co/) for backing this project.
