@@ -8,3 +8,8 @@ Initial release
 
 #### Bug Fix
 Removed device assignment that was causing errors on distributed training setups
+
+## 0.1.2 (2024-05-16)
+
+#### Bug Fix
+Error in tensor shapes. Was processing as the incorrect [batch, channels, stem, samples] instead of the correct [batch, stem, channels, samples] in some places.
