@@ -23,3 +23,8 @@ Moved frequency weighting image to be included in the package.
 
 #### Image Bug
 Moving image again and correcting reference.
+
+## 0.1.5 (2024-05-17)
+
+#### Added Logo
+Added repo logo.
