@@ -28,3 +28,8 @@ Moving image again and correcting reference.
 
 #### Added Logo
 Added repo logo.
+
+## 0.1.5 (2024-05-20)
+
+#### Convolution Bug
+The convolution operation was previously introducing an unintended time shift due to incorrect padding and trimming. This was causing models to inadvertently learn these time shifts when the operation was used as a loss function. This issue has now been corrected. The convolution operation is now time-invariant, meaning it will not introduce any unwanted time shifts.
