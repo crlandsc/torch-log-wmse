@@ -33,3 +33,12 @@ Added repo logo.
 
 #### Convolution Bug
 The convolution operation was previously introducing an unintended time shift due to incorrect padding and trimming. This was causing models to inadvertently learn these time shifts when the operation was used as a loss function. This issue has now been corrected. The convolution operation is now time-invariant, meaning it will not introduce any unwanted time shifts.
+
+## 0.1.6 (2024-05-22)
+
+#### RMS Bug
+If the unprocessed audio was silent, a value was immediately being returned unrelated to the model predictions. While this is how the original metric was implemented [here](https://github.com/nomonosound/log-wmse-audio-quality), the RMS value should actually be replaced with epsilon so that the difference between a non-silent output and silent output can be measured.
+
+Added test for silent input & target.
+
+Adjusted circular shift to account for IR with odd number of samples.
