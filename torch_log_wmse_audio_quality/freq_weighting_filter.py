@@ -150,7 +150,7 @@ class HumanHearingSensitivityFilter:
 
         # Circularly shift signal to account for symmetric IR time delay
         if self.symmetric_ir:
-            shift = self.fft_size // 2
+            shift = (self.fft_size - (self.impulse_response.shape[-1] % 2)) // 2 - 1 # added case for odd length IR
             filtered_audio = torch.roll(filtered_audio, -shift, dims=-1)
 
         return filtered_audio[..., :self.audio_length_samples]
