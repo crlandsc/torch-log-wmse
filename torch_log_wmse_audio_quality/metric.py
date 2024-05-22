@@ -62,10 +62,6 @@ class LogWMSE(torch.nn.Module):
 
         input_rms = calculate_rms(self.filters(unprocessed_audio.unsqueeze(1))) # unsqueeze to add "stem" dimension
 
-        # Avoid log(0)
-        if input_rms.sum() == 0:
-            return torch.log(torch.tensor(EPS)) * SCALER
-
         # Calculate the logWMSE
         values = self._calculate_log_wmse(
             input_rms,
@@ -98,6 +94,11 @@ class LogWMSE(torch.nn.Module):
         Returns:
             Tensor: The logWMSE between the processed audio and target audio.
         """
+
+        # Add EPS if input_rms is 0 (silence) to avoid NaNs
+        if input_rms.sum() == 0:
+            input_rms = torch.ones_like(input_rms) * ERROR_TOLERANCE_THRESHOLD
+
         # Calculate the scaling factor based on the input RMS
         scaling_factor = 1 / input_rms
 
