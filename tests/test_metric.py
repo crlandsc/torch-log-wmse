@@ -89,7 +89,7 @@ class TestLogWMSELoss(unittest.TestCase):
 
                     # Generate random inputs (scale between -1 and 1)
                     audio_lengths_samples = int(audio_length * sample_rate)
-                    unprocessed_audio = torch.zeros(batch, audio_channels, audio_lengths_samples)
+                    unprocessed_audio = torch.rand(batch, audio_channels, audio_lengths_samples) * convert_decibels_to_amplitude_ratio(-75)
                     processed_audio = torch.rand(batch, audio_stems, audio_channels, audio_lengths_samples) * convert_decibels_to_amplitude_ratio(-60)
                     target_audio = torch.zeros(batch, audio_stems, audio_channels, audio_lengths_samples)
 

@@ -95,8 +95,8 @@ class LogWMSE(torch.nn.Module):
             Tensor: The logWMSE between the processed audio and target audio.
         """
 
-        # Add EPS if input_rms is 0 (silence) to avoid NaNs
-        if input_rms.sum() == 0:
+        # Add EPS if input_rms is 0 (silence), or close to it, to avoid NaNs
+        if input_rms.sum() < ERROR_TOLERANCE_THRESHOLD:
             input_rms = torch.ones_like(input_rms) * ERROR_TOLERANCE_THRESHOLD
 
         # Calculate the scaling factor based on the input RMS
