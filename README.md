@@ -1,6 +1,6 @@
-![torch-log-wmse-logo](https://raw.githubusercontent.com/crlandsc/torch-log-wmse-audio-quality/main/images/logo.png)
+![torch-log-wmse-logo](https://raw.githubusercontent.com/crlandsc/torch-log-wmse/main/images/logo.png)
 
-[![LICENSE](https://img.shields.io/github/license/crlandsc/torch-log-wmse-audio-quality)](https://github.com/crlandsc/torch-log-wmse-audio-quality/blob/main/LICENSE) [![GitHub Repo stars](https://img.shields.io/github/stars/crlandsc/torch-log-wmse-audio-quality)](https://github.com/crlandsc/torch-log-wmse-audio-quality/stargazers) [![GitHub forks](https://img.shields.io/github/forks/crlandsc/torch-log-wmse-audio-quality)](https://github.com/crlandsc/torch-log-wmse-audio-quality/forks)
+[![LICENSE](https://img.shields.io/github/license/crlandsc/torch-log-wmse)](https://github.com/crlandsc/torch-log-wmse/blob/main/LICENSE) [![GitHub Repo stars](https://img.shields.io/github/stars/crlandsc/torch-log-wmse)](https://github.com/crlandsc/torch-log-wmse/stargazers) [![GitHub forks](https://img.shields.io/github/forks/crlandsc/torch-log-wmse)](https://github.com/crlandsc/torch-log-wmse/forks)
 
 This repository contains the torch implementation of an audio quality metric, [logWMSE](https://github.com/nomonosound/log-wmse-audio-quality), originally proposed by [Iver Jordal](https://github.com/iver56) of [Nomono](https://nomono.co/). In addition to the original metric, this implementation can also be used as a loss function for training audio separation and denoising models.
 
@@ -65,7 +65,7 @@ The goal of this metric is to account for several factors not present in current
 ##### Frequency Weighting
 To measure the frequencies of a signal closer to that of human hearing, the following frequency weighting is applied. This helps the model effectively pay less attention to errors at frequencies that humans are not sensitive to (e.g. 50 Hz) and give more weight to those that we are acutely tuned to (e.g. 3kHz).
 
-![Frequency Weighting](https://raw.githubusercontent.com/crlandsc/torch-log-wmse-audio-quality/main/images/frequency_weighting.png)
+![Frequency Weighting](https://raw.githubusercontent.com/crlandsc/torch-log-wmse/main/images/frequency_weighting.png)
 
 This metric has been constructed with high-fidelity audio in mind (sample rates &ge; 44.1kHz). It theoretically could work for lower sample rates, like 16kHz, but the metric performs an internal resampling to 44.1kHz for consistency across any input sample rates.
 

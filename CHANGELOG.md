@@ -67,3 +67,8 @@ from torch_log_wmse import LogWMSE
 
 #### Updated badges
 Updated badge references in the `README`.
+
+## 0.2.2 (2024-06-18)
+
+#### Changed GitHub repo name & references
+Updated GitHub repo name to appropriate `torch-log-wmse`. `torch-log-wmse-audio-quality` can still be installed, but everything will reference the new name (`torch-log-wmse`) moving forward.
