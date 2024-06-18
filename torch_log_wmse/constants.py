@@ -1,4 +1,4 @@
-from torch_log_wmse_audio_quality.utils import convert_decibels_to_amplitude_ratio
+from torch_log_wmse.utils import convert_decibels_to_amplitude_ratio
 
 # FFT size for human hearing sensitivity filter impulse response calculation
 N_FFT = 4096

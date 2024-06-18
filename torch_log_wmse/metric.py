@@ -2,13 +2,13 @@ import torch
 from torch import Tensor
 from typing import Callable, Optional
 
-from torch_log_wmse_audio_quality.constants import (
+from torch_log_wmse.constants import (
     ERROR_TOLERANCE_THRESHOLD,
     SCALER,
     EPS,
 )
-from torch_log_wmse_audio_quality.freq_weighting_filter import HumanHearingSensitivityFilter
-from torch_log_wmse_audio_quality.utils import calculate_rms
+from torch_log_wmse.freq_weighting_filter import HumanHearingSensitivityFilter
+from torch_log_wmse.utils import calculate_rms
 
 
 class LogWMSE(torch.nn.Module):
