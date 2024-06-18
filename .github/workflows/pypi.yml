@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: production
-      url: https://pypi.org/p/torch-log-wmse-audio-quality  # Replace <package-name> with your PyPI project name
+      url: https://pypi.org/p/torch-log-wmse
     permissions:
       id-token: write  # IMPORTANT: mandatory for trusted publishing
     steps:
