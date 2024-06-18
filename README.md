@@ -11,13 +11,13 @@ logWMSE is a custom metric and loss function for audio signals that calculates t
 [![PyPI - Python Version](https://img.shields.io/pypi/pyversions/torch-log-wmse-audio-quality)](https://pypi.org/project/torch-log-wmse-audio-quality/) [![PyPI - Version](https://img.shields.io/pypi/v/torch-log-wmse-audio-quality)](https://pypi.org/project/torch-log-wmse-audio-quality/) [![Number of downloads from PyPI per month](https://img.shields.io/pypi/dm/torch-log-wmse-audio-quality)](https://pypi.org/project/torch-log-wmse-audio-quality/)
 
 
-`pip install torch-log-wmse-audio-quality`
+`pip install torch-log-wmse`
 
 ## Usage Example
 
 ```python
 import torch
-from torch_log_wmse_audio_quality import LogWMSE
+from torch_log_wmse import LogWMSE
 
 # Tensor shapes
 audio_length = 1.0

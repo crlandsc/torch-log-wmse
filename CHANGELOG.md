@@ -47,3 +47,8 @@ Adjusted circular shift to account for IR with odd number of samples.
 
 #### Minimum threshold fix
 Changed scaling factor so RMS doesn't need to = 0, rather just be lower than the error threshold to replace with min value. If it only could be 0, then very tiny numbers even closer to 0 would still go through.
+
+## 0.1.9 (2024-06-18)
+
+#### Package name update
+Publishing as `torch-log-wmse` (for brevity) as well as `torch-log-wmse-audio-quality`.
