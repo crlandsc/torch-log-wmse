@@ -57,3 +57,8 @@ Publishing as `torch-log-wmse` (for brevity) as well as `torch-log-wmse-audio-qu
 
 #### Finalizing name change
 Updated all references to `torch_log_wmse` independent of installation name (i.e. `torch-log-wmse` or `torch-log-wmse-audio-quality`).
+
+## 0.2.1 (2024-06-18)
+
+#### Updated badges
+Updated badge references in the `README`.
