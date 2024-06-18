@@ -1,4 +1,4 @@
-![torch-log-wmse-audio-quality-logo](https://raw.githubusercontent.com/crlandsc/torch-log-wmse-audio-quality/main/images/logo.png)
+![torch-log-wmse-logo](https://raw.githubusercontent.com/crlandsc/torch-log-wmse-audio-quality/main/images/logo.png)
 
 [![LICENSE](https://img.shields.io/github/license/crlandsc/torch-log-wmse-audio-quality)](https://github.com/crlandsc/torch-log-wmse-audio-quality/blob/main/LICENSE) [![GitHub Repo stars](https://img.shields.io/github/stars/crlandsc/torch-log-wmse-audio-quality)](https://github.com/crlandsc/torch-log-wmse-audio-quality/stargazers) [![GitHub forks](https://img.shields.io/github/forks/crlandsc/torch-log-wmse-audio-quality)](https://github.com/crlandsc/torch-log-wmse-audio-quality/forks)
 
