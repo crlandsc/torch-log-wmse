@@ -56,7 +56,12 @@ Publishing as `torch-log-wmse` (for brevity) as well as `torch-log-wmse-audio-qu
 ## 0.2.0 (2024-06-18)
 
 #### Finalizing name change
-Updated all references to `torch_log_wmse` independent of installation name (i.e. `torch-log-wmse` or `torch-log-wmse-audio-quality`).
+Updated all references to **`torch_log_wmse`** independent of installation name (i.e. `pip install torch-log-wmse` or `pip install torch-log-wmse-audio-quality`).
+
+Imports now **MUST** be done as the following:
+```
+from torch_log_wmse import LogWMSE
+```
 
 ## 0.2.1 (2024-06-18)
 
