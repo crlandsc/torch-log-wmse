@@ -1,6 +1,6 @@
 ![torch-log-wmse-logo](https://raw.githubusercontent.com/crlandsc/torch-log-wmse/main/images/logo.png)
 
-[![LICENSE](https://img.shields.io/github/license/crlandsc/torch-log-wmse)](https://github.com/crlandsc/torch-log-wmse/blob/main/LICENSE) [![GitHub Repo stars](https://img.shields.io/github/stars/crlandsc/torch-log-wmse)](https://github.com/crlandsc/torch-log-wmse/stargazers) [![GitHub forks](https://img.shields.io/github/forks/crlandsc/torch-log-wmse)](https://github.com/crlandsc/torch-log-wmse/forks)
+[![LICENSE](https://img.shields.io/github/license/crlandsc/torch-log-wmse)](https://github.com/crlandsc/torch-log-wmse/blob/main/LICENSE) [![GitHub Repo stars](https://img.shields.io/github/stars/crlandsc/torch-log-wmse)](https://github.com/crlandsc/torch-log-wmse/stargazers) <!-- [![GitHub forks](https://img.shields.io/github/forks/crlandsc/torch-log-wmse)](https://github.com/crlandsc/torch-log-wmse/forks) -->
 
 This repository contains the torch implementation of an audio quality metric, [logWMSE](https://github.com/nomonosound/log-wmse-audio-quality), originally proposed by [Iver Jordal](https://github.com/iver56) of [Nomono](https://nomono.co/). In addition to the original metric, this implementation can also be used as a loss function for training audio separation and denoising models.
 
