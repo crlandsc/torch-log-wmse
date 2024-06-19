@@ -98,7 +98,7 @@ class HumanHearingSensitivityFilter:
         ):
         # Load the impulse response if not provided
         if impulse_response is None:
-            with resources.open_binary("torch_log_wmse_audio_quality", "filter_ir.pkl") as f:
+            with resources.open_binary("torch_log_wmse", "filter_ir.pkl") as f:
                 impulse_response = torch.tensor(pickle.load(f), dtype=torch.float32)
 
         # Resample the impulse response if necessary

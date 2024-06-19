@@ -72,3 +72,8 @@ Updated badge references in the `README`.
 
 #### Changed GitHub repo name & references
 Updated GitHub repo name to appropriate `torch-log-wmse`. `torch-log-wmse-audio-quality` can still be installed, but everything will reference the new name (`torch-log-wmse`) moving forward.
+
+## 0.2.3 (2024-06-19)
+
+#### Weighted filter reference bug
+Corrected file reference to pkl filter file.
