@@ -77,3 +77,8 @@ Updated GitHub repo name to appropriate `torch-log-wmse`. `torch-log-wmse-audio-
 
 #### Weighted filter reference bug
 Corrected file reference to pkl filter file.
+
+## 0.2.4 (2024-06-21)
+
+#### Added `torch_log_wmse_audio_quality` alias
+added alias file so imports can either be `torch_log_wmse` or `torch_log_wmse_audio_quality`
