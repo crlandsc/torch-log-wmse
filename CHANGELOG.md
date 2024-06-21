@@ -82,3 +82,7 @@ Corrected file reference to pkl filter file.
 
 #### Added `torch_log_wmse_audio_quality` alias
 added alias file so imports can either be `torch_log_wmse` or `torch_log_wmse_audio_quality`
+
+## 0.2.5 (2024-06-21)
+
+#### `torch_log_wmse_audio_quality` alias bug
