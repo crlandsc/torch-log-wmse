@@ -1,1 +1,1 @@
-from torch_log_wmse import *
+from torch_log_wmse import LogWMSE
