@@ -1,11 +1,19 @@
+# Add directory to python path if needed
+import sys
+sys.path.append("/Users/chris/Desktop/Whitebalance/torch-log-wmse")
+
 import unittest
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from torch_log_wmse import LogWMSE
-from torch_log_wmse.utils import calculate_rms
+from torch_log_wmse.utils import calculate_rms, convert_decibels_to_amplitude_ratio
 from torch_log_wmse.freq_weighting_filter import prepare_impulse_response_fft, HumanHearingSensitivityFilter
-from torch_log_wmse.utils import convert_decibels_to_amplitude_ratio
+
+# Test alias package
+# from torch_log_wmse_audio_quality import LogWMSE
+# from torch_log_wmse_audio_quality.utils import calculate_rms, convert_decibels_to_amplitude_ratio
+# from torch_log_wmse_audio_quality.freq_weighting_filter import prepare_impulse_response_fft, HumanHearingSensitivityFilter
 
 class TestLogWMSELoss(unittest.TestCase):
     def setUp(self):
