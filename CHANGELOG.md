@@ -82,3 +82,10 @@ Corrected file reference to pkl filter file.
 
 #### Added `torch_log_wmse_audio_quality` alias
 added alias file so imports can either be `torch_log_wmse` or `torch_log_wmse_audio_quality`.
+
+## 0.2.8 (2024-07-31)
+
+#### Added ability to bypass frequency weightning + bug fixes
+Added `bypass_filter` argument that will bypass frequency weighting if `True`.
+
+Fixed bug that returns NaN when one of the entries in the batch is a digital silence triplet - Thanks to Iver Jordal for the [issue](https://github.com/crlandsc/torch-log-wmse/issues/2) & [PR](https://github.com/crlandsc/torch-log-wmse/pull/3)!
