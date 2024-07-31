@@ -130,6 +130,22 @@ class TestLogWMSELoss(unittest.TestCase):
 
                     print(f"Test {i}, Subtest {j}, Audio Length: {audio_length}, Loss: {loss}, Seed: {(i+1)*(j+1)}")
 
+    def test_digital_silence_in_batch(self):
+        loss_function = LogWMSE(audio_length=1, return_as_loss=True)
+        torch.manual_seed(0)
+        raw = torch.randn(2, 1, 44100, dtype=torch.float32)
+        raw[0] = 0.0
+        est = torch.randn(2, 1, 44100, dtype=torch.float32)
+        est[0] = 0.0
+        gt = torch.randn(2, 1, 44100, dtype=torch.float32)
+        gt[0] = 0.0
+        loss0 = loss_function(raw[0:1], est[0:1].unsqueeze(2), gt[0:1].unsqueeze(2)).detach().item()
+        self.assertAlmostEqual(loss0, -73.6827, places=4)
+        loss1 = loss_function(raw[1:2], est[1:2].unsqueeze(2), gt[1:2].unsqueeze(2)).detach().item()
+        self.assertAlmostEqual(loss1, 2.7475, places=4)
+        loss_combined = loss_function(raw, est.unsqueeze(2), gt.unsqueeze(2))
+        self.assertFalse(torch.isnan(loss_combined))
+
 class TestFreqWeightingFilter(unittest.TestCase):
     def setUp(self):
         # Example audio data, replace with actual audio loading if needed
