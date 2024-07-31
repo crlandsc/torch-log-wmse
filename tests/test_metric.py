@@ -78,6 +78,33 @@ class TestLogWMSELoss(unittest.TestCase):
 
                     print(f"Test {i}, Subtest {j}, Audio Length: {audio_length}, Loss: {loss}, Seed: {(i+1)*(j+1)}")
 
+    def test_bypass_filter(self):
+        print("Test forward with bypassing the frequency weighting filter")
+        audio_lengths = [0.1, 0.5, 1.0]  # Different audio lengths
+        sample_rate = 44100
+        audio_channels = 2 # stereo
+        audio_stems = 3 # 3 audio stems
+        batch = 4 # batch size
+
+        for i, audio_length in enumerate(audio_lengths):
+            log_wmse_loss = LogWMSE(audio_length=audio_length, sample_rate=sample_rate, bypass_filter=True)
+            for j in range(3):
+                with self.subTest(i=i, j=j):
+                    torch.manual_seed((i+1)*(j+1)) # Ensure reproducibility
+
+                    # Generate random inputs (scale between -1 and 1)
+                    audio_lengths_samples = int(audio_length * sample_rate)
+                    unprocessed_audio = 2 * torch.rand(batch, audio_channels, audio_lengths_samples) - 1
+                    processed_audio = unprocessed_audio.unsqueeze(1).expand(-1, audio_stems, -1, -1) * 0.1
+                    target_audio = torch.zeros(batch, audio_stems, audio_channels, audio_lengths_samples)
+
+                    loss = log_wmse_loss(unprocessed_audio, processed_audio, target_audio)
+
+                    self.assertIsInstance(loss, torch.Tensor)
+                    self.assertEqual(loss.ndim, 0)
+
+                    print(f"Test {i}, Subtest {j}, Audio Length: {audio_length}, Loss: {loss}, Seed: {(i+1)*(j+1)}")
+
     # Test forward with silence
     def test_forward_silence(self):
         print("Test forward with silence")
