@@ -1,6 +1,6 @@
-# Add directory to python path if needed
+import os
 import sys
-sys.path.append("/Users/chris/Desktop/Whitebalance/torch-log-wmse")
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import unittest
 import torch
