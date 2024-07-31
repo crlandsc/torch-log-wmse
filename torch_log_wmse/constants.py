@@ -13,3 +13,5 @@ SCALER = -4.0
 
 # Small constant to avoid taking log of zero
 EPS = 1e-8
+
+RMS_EPS = 1e-8

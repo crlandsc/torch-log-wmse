@@ -2,11 +2,7 @@ import torch
 from torch import Tensor
 from typing import Callable, Optional
 
-from torch_log_wmse.constants import (
-    ERROR_TOLERANCE_THRESHOLD,
-    SCALER,
-    EPS,
-)
+from torch_log_wmse.constants import ERROR_TOLERANCE_THRESHOLD, SCALER, EPS, RMS_EPS
 from torch_log_wmse.freq_weighting_filter import HumanHearingSensitivityFilter
 from torch_log_wmse.utils import calculate_rms
 
@@ -14,13 +10,13 @@ from torch_log_wmse.utils import calculate_rms
 class LogWMSE(torch.nn.Module):
     """
     logWMSE is a custom metric and loss function for audio signals that calculates the logarithm
-    of a frequency-weighted Mean Squared Error (MSE). It is designed to address several shortcomings 
+    of a frequency-weighted Mean Squared Error (MSE). It is designed to address several shortcomings
     of common audio metrics, most importantly the lack of support for digital silence targets.
 
     Key features of logWMSE:
     * Supports digital silence targets not supported by other audio metrics.
         i.e. (SI-)SDR, SIR, SAR, ISR, VISQOL_audio, STOI, CDPAM, and VISQOL.
-    * Overcomes the small value range issue of MSE (i.e. between 1e-8 and 1e-3), making number 
+    * Overcomes the small value range issue of MSE (i.e. between 1e-8 and 1e-3), making number
         formatting and sight-reading easier. Scaled similar to SI-SDR.
     * Scale-invariant, aligns with the frequency sensitivity of human hearing.
     * Invariant to the tiny errors of MSE that are inaudible to humans.
@@ -30,7 +26,7 @@ class LogWMSE(torch.nn.Module):
     Args:
         audio_length (int): The length of the audio signal in seconds.
         sample_rate (int, optional): The sample rate of the audio signal in Hz. Defaults to 44100.
-        impulse_response (Tensor, optional): The finite impulse response (FIR) filter for 
+        impulse_response (Tensor, optional): The finite impulse response (FIR) filter for
             frequency weighting. If None (default), use built-in FIR. Currently only supports
             single-channel FIRs (applied to all batches & audio channels).
         impulse_response_sample_rate (int, optional): The sample rate of the FIR in Hz. Defaults to 44100.
@@ -49,7 +45,7 @@ class LogWMSE(torch.nn.Module):
             audio_length=audio_length,
             sample_rate=sample_rate,
             impulse_response=impulse_response,
-            impulse_response_sample_rate=impulse_response_sample_rate
+            impulse_response_sample_rate=impulse_response_sample_rate,
         )
         self.return_as_loss = return_as_loss
 
@@ -95,12 +91,8 @@ class LogWMSE(torch.nn.Module):
             Tensor: The logWMSE between the processed audio and target audio.
         """
 
-        # Add EPS if input_rms is 0 (silence), or close to it, to avoid NaNs
-        if input_rms.sum() < ERROR_TOLERANCE_THRESHOLD:
-            input_rms = torch.ones_like(input_rms) * ERROR_TOLERANCE_THRESHOLD
-
         # Calculate the scaling factor based on the input RMS
-        scaling_factor = 1 / input_rms
+        scaling_factor = 1 / (input_rms + RMS_EPS)
 
         # Add extra dimensions to scaling_factor to match the shape of processed_audio and target_audio
         if scaling_factor.dim() == 2:
