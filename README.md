@@ -27,8 +27,14 @@ audio_channels = 2 # stereo
 batch = 4 # batch size
 
 # Instantiate logWMSE
-# Set `return_as_loss=False` to resturn as a positive metric
-log_wmse = LogWMSE(audio_length=audio_length, sample_rate=sample_rate, return_as_loss=True)
+# Set `return_as_loss=False` to resturn as a positive metric (Default: True)
+# Set `bypass_filter=True` to bypass frequency weighting (Default: False)
+log_wmse = LogWMSE(
+    audio_length=audio_length,
+    sample_rate=sample_rate,
+    return_as_loss=True, # optional
+    bypass_filter=False, # optional
+)
 
 # Generate random inputs (scale between -1 and 1)
 audio_lengths_samples = int(audio_length * sample_rate)

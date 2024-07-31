@@ -89,3 +89,8 @@ added alias file so imports can either be `torch_log_wmse` or `torch_log_wmse_au
 Added `bypass_filter` argument that will bypass frequency weighting if `True`.
 
 Fixed bug that returns NaN when one of the entries in the batch is a digital silence triplet - Thanks to Iver Jordal for the [issue](https://github.com/crlandsc/torch-log-wmse/issues/2) & [PR](https://github.com/crlandsc/torch-log-wmse/pull/3)!
+
+## 0.2.9 (2024-07-31)
+
+#### Updated README
+Updated README to reflect 0.2.8 `bypass_filter` update.
