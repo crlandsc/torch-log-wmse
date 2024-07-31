@@ -2,6 +2,7 @@
 .python-version
 .vscode/
 log-wmse-frequency-response.ipynb
+.DS_Store
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
