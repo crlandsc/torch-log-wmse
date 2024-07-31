@@ -14,4 +14,5 @@ SCALER = -4.0
 # Small constant to avoid taking log of zero
 EPS = 1e-8
 
+# Small constant to avoid division by zero in RMS scaling_factor calculation
 RMS_EPS = 1e-8
