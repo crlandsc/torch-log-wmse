@@ -1,6 +1,7 @@
 # User
 .python-version
 .vscode/
+log-wmse-frequency-response.ipynb
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
