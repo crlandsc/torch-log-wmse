@@ -31,6 +31,7 @@ class LogWMSE(torch.nn.Module):
             single-channel FIRs (applied to all batches & audio channels).
         impulse_response_sample_rate (int, optional): The sample rate of the FIR in Hz. Defaults to 44100.
         return_as_loss (bool, optional): Whether to return the loss value (i.e. negative of the metric). Defaults to True.
+        bypass_filter (bool, optional): Whether to bypass the frequency weighting filter. Defaults to False.
     """
     def __init__(
             self,
@@ -39,6 +40,7 @@ class LogWMSE(torch.nn.Module):
             impulse_response: Optional[Tensor] = None,
             impulse_response_sample_rate: int = 44100,
             return_as_loss: bool = True,
+            bypass_filter: bool = False,
         ):
         super().__init__()
         self.filters = HumanHearingSensitivityFilter(
@@ -48,6 +50,7 @@ class LogWMSE(torch.nn.Module):
             impulse_response_sample_rate=impulse_response_sample_rate,
         )
         self.return_as_loss = return_as_loss
+        self.bypass_filter = bypass_filter
 
     def forward(self, unprocessed_audio: Tensor, processed_audio: Tensor, target_audio: Tensor):
         assert unprocessed_audio.ndim == 3 # unprocessed_audio audio shape: [batch, channel, time]
@@ -56,7 +59,10 @@ class LogWMSE(torch.nn.Module):
         assert processed_audio.shape == target_audio.shape # processed_audio and target_audio should have the same shape
         assert processed_audio.shape[-1] == target_audio.shape[-1] == unprocessed_audio.shape[-1] # all should have the same length
 
-        input_rms = calculate_rms(self.filters(unprocessed_audio.unsqueeze(1))) # unsqueeze to add "stem" dimension
+        if self.bypass_filter:
+            input_rms = calculate_rms(unprocessed_audio.unsqueeze(1))
+        else:
+            input_rms = calculate_rms(self.filters(unprocessed_audio.unsqueeze(1))) # unsqueeze to add "stem" dimension
 
         # Calculate the logWMSE
         values = self._calculate_log_wmse(
@@ -64,6 +70,7 @@ class LogWMSE(torch.nn.Module):
             self.filters,
             processed_audio,
             target_audio,
+            bypass_filter=self.bypass_filter,
         )
 
         if self.return_as_loss:
@@ -77,6 +84,7 @@ class LogWMSE(torch.nn.Module):
         filters: Callable,
         processed_audio: Tensor,
         target_audio: Tensor,
+        bypass_filter: bool = False,
     ):
         """
         Calculate the logWMSE between the processed audio and target audio.
@@ -104,7 +112,11 @@ class LogWMSE(torch.nn.Module):
         scaling_factor = scaling_factor.expand(*processed_audio.shape)
 
         # Calculate the frequency-weighted differences, ignoring small imperceptible differences
-        differences = filters(processed_audio * scaling_factor) - filters(target_audio * scaling_factor)
+        # Skip frequency weighting if bypass_filter is True
+        if bypass_filter:
+            differences = (processed_audio * scaling_factor) - (target_audio * scaling_factor)
+        else:
+            differences = filters(processed_audio * scaling_factor) - filters(target_audio * scaling_factor)
         differences[torch.abs(differences) < ERROR_TOLERANCE_THRESHOLD] = 0.0
 
         # Calculate the mean squared differences
