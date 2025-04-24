@@ -4,6 +4,7 @@ from torchaudio.transforms import Resample
 import importlib.resources as resources
 import pickle
 import math
+from typing import Optional
 
 
 def prepare_impulse_response_fft(impulse_response, fft_size, symmetric_ir=True):
@@ -46,7 +47,8 @@ def fft_convolve(audio_batch, impulse_response_fft, fft_size):
     Performs FFT convolution on a batch of audio signals using a precomputed impulse response FFT.
 
     Args:
-    - audio_batch: A batch of time-domain audio signals, with shape [batch_size, channels, signal_length].
+    - audio_batch: A batch of time-domain audio signals. 
+                   Expected shape: [batch, channel, signal_length] or [batch, channel, stem, signal_length].
     - impulse_response_fft: The precomputed FFT of the impulse response (frequency domain), with shape [1, 1, fft_size // 2 + 1].
 
     Returns:
@@ -92,7 +94,7 @@ class HumanHearingSensitivityFilter:
             self,
             audio_length: int = 1,
             sample_rate: int = 44100,
-            impulse_response: Tensor = None,
+            impulse_response: Optional[torch.Tensor] = None,
             impulse_response_sample_rate: int = 44100,
             symmetric_ir: bool = True,
         ):
@@ -129,13 +131,13 @@ class HumanHearingSensitivityFilter:
               methods.
         
         Args: audio (torch.Tensor): A tensor containing the audio signal to be filtered. 
-                                    Expected shape is [batch, stem, channels, time].
+                                    Expected shape is [batch, channel, stem, time].
         
         Returns: torch.Tensor: The filtered audio signal with the same shape as the input.
         """
-        # Ensure audio has the correct dimensions: [batch, stem, channels, time]
+        # Ensure audio has the correct dimensions: [batch, channel, stem, time]
         if audio.ndim != 4:
-            raise ValueError("Audio input must have dimensions [batch, stem, channels, time].")
+            raise ValueError("Audio input must have dimensions [batch, channel, stem, time].")
 
         # Move impulse response to audio device if necessary
         if self.impulse_response_fft.device != audio.device:

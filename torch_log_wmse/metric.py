@@ -4,7 +4,7 @@ from typing import Callable, Optional
 
 from torch_log_wmse.constants import ERROR_TOLERANCE_THRESHOLD, SCALER, EPS, RMS_EPS
 from torch_log_wmse.freq_weighting_filter import HumanHearingSensitivityFilter
-from torch_log_wmse.utils import calculate_rms
+from torch_log_wmse.utils import calculate_rms, apply_reduction
 
 
 class LogWMSE(torch.nn.Module):
@@ -32,6 +32,7 @@ class LogWMSE(torch.nn.Module):
         impulse_response_sample_rate (int, optional): The sample rate of the FIR in Hz. Defaults to 44100.
         return_as_loss (bool, optional): Whether to return the loss value (i.e. negative of the metric). Defaults to True.
         bypass_filter (bool, optional): Whether to bypass the frequency weighting filter. Defaults to False.
+        reduction (str, optional): The reduction method to apply to the logWMSE values. Defaults to "mean".
     """
     def __init__(
             self,
@@ -41,6 +42,7 @@ class LogWMSE(torch.nn.Module):
             impulse_response_sample_rate: int = 44100,
             return_as_loss: bool = True,
             bypass_filter: bool = False,
+            reduction: str = "mean",
         ):
         super().__init__()
         self.filters = HumanHearingSensitivityFilter(
@@ -51,7 +53,7 @@ class LogWMSE(torch.nn.Module):
         )
         self.return_as_loss = return_as_loss
         self.bypass_filter = bypass_filter
-
+        self.reduction = reduction
     def forward(self, unprocessed_audio: Tensor, processed_audio: Tensor, target_audio: Tensor):
         assert unprocessed_audio.ndim == 3 # unprocessed_audio audio shape: [batch, channel, time]
         assert processed_audio.ndim == 4 # processed_audio audio shape: [batch, channel, stem, time]
@@ -60,9 +62,9 @@ class LogWMSE(torch.nn.Module):
         assert processed_audio.shape[-1] == target_audio.shape[-1] == unprocessed_audio.shape[-1] # all should have the same length
 
         if self.bypass_filter:
-            input_rms = calculate_rms(unprocessed_audio.unsqueeze(1))
+            input_rms = calculate_rms(unprocessed_audio.unsqueeze(2))  # [batch, channel, time] -> [batch, channel, stem=1, time]
         else:
-            input_rms = calculate_rms(self.filters(unprocessed_audio.unsqueeze(1))) # unsqueeze to add "stem" dimension
+            input_rms = calculate_rms(self.filters(unprocessed_audio.unsqueeze(2)))  # [batch, channel, time] -> [batch, channel, stem=1, time]
 
         # Calculate the logWMSE
         values = self._calculate_log_wmse(
@@ -73,10 +75,13 @@ class LogWMSE(torch.nn.Module):
             bypass_filter=self.bypass_filter,
         )
 
+        # Apply reduction using the utility function
+        reduced_values = apply_reduction(values, self.reduction)
+
         if self.return_as_loss:
-            return -torch.mean(values)
+            return -reduced_values
         else:
-            return torch.mean(values)
+            return reduced_values
 
     @staticmethod
     def _calculate_log_wmse(
@@ -90,10 +95,11 @@ class LogWMSE(torch.nn.Module):
         Calculate the logWMSE between the processed audio and target audio.
 
         Args:
-            input_rms (Tensor): The root mean square of the input audio.
+            input_rms (Tensor): The root mean square of the input audio. Shape: [batch, channel, stem].
             filters (Callable): A function that applies a filter to the audio (i.e. HumanHearingSensitivityFilter).
-            processed_audio (Tensor): The processed audio tensor.
-            target_audio (Tensor): The target audio tensor.
+            processed_audio (Tensor): The processed audio tensor. Shape: [batch, channel, stem, time].
+            target_audio (Tensor): The target audio tensor. Shape: [batch, channel, stem, time].
+            bypass_filter (bool, optional): Whether to bypass the frequency weighting filter. Defaults to False.
 
         Returns:
             Tensor: The logWMSE between the processed audio and target audio.
@@ -102,15 +108,10 @@ class LogWMSE(torch.nn.Module):
         # Calculate the scaling factor based on the input RMS
         scaling_factor = 1 / (input_rms + RMS_EPS)
 
-        # Add extra dimensions to scaling_factor to match the shape of processed_audio and target_audio
-        if scaling_factor.dim() == 2:
-            scaling_factor = scaling_factor.unsqueeze(1)
+        # Add extra dimension(s) to scaling_factor to match the shape of processed_audio and target_audio
         while scaling_factor.dim() < processed_audio.dim():
             scaling_factor = scaling_factor.unsqueeze(-1)
-
-        # Expand scaling_factor to match the shape of processed_audio and target_audio
-        scaling_factor = scaling_factor.expand(*processed_audio.shape)
-
+        
         # Calculate the frequency-weighted differences, ignoring small imperceptible differences
         # Skip frequency weighting if bypass_filter is True
         if bypass_filter:
