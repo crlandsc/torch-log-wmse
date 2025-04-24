@@ -94,3 +94,12 @@ Fixed bug that returns NaN when one of the entries in the batch is a digital sil
 
 #### Updated README
 Updated README to reflect 0.2.8 `bypass_filter` update.
+
+## 0.3.0 (2025-04-24)
+
+#### Added reduction argument and fixed tensor shape handling
+- Added `reduction` argument to control how the loss/metric is aggregated, supporting 'mean' (default), 'sum', and 'none' options
+- Fixed tensor shape inconsistencies throughout the codebase to consistently use [batch, channel, stem, time] format
+- Updated docstrings and comments to correctly document expected tensor shapes
+- Optimized scaling_factor broadcasting
+- Added comprehensive test for all reduction options
