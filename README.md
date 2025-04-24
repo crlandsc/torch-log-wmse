@@ -39,8 +39,8 @@ log_wmse = LogWMSE(
 # Generate random inputs (scale between -1 and 1)
 audio_lengths_samples = int(audio_length * sample_rate)
 unprocessed_audio = 2 * torch.rand(batch, audio_channels, audio_lengths_samples) - 1
-processed_audio = unprocessed_audio.unsqueeze(1).expand(-1, audio_stems, -1, -1) * 0.1
-target_audio = torch.zeros(batch, audio_stems, audio_channels, audio_lengths_samples)
+processed_audio = 2 * torch.rand(batch, audio_channels, audio_stems, audio_lengths_samples) - 1
+target_audio = torch.zeros(batch, audio_channels, audio_stems, audio_lengths_samples)
 
 log_wmse = log_wmse(unprocessed_audio, processed_audio, target_audio)
 print(log_wmse)  # Expected output: approx. -18.42
@@ -48,13 +48,13 @@ print(log_wmse)  # Expected output: approx. -18.42
 
 logWMSE accepts three torch tensors of the following shapes:
 - unprocessed_audio: `[batch, audio_channels, samples]`
-- processed_audio: `[batch, audio_stems, audio_channels, samples]`
-- target_audio: `[batch, audio_stems, audio_channels, samples]`
+- processed_audio: `[batch, audio_channels, audio_stems, samples]`
+- target_audio: `[batch, audio_channels, audio_stems, samples]`
 
 Each dimension being:
 - `batch`: Number of audio files in a batch (i.e. batch size).
-- `audio_stems`: Number of separate audio sources. For source separation, this could be multiple different instruments, vocals, etc. For denoising audio, this will be 1.
 - `audio_channels`: Number of channels (i.e. 1 for mono and 2 for stereo).
+- `audio_stems`: Number of separate audio sources. For source separation, this could be multiple different instruments, vocals, etc. For denoising audio, this will be 1.
 - `samples`: Number of audio samples (e.g. 1 second of audio @ 44.1kHz is 44100 samples).
 
 ## Motivation
