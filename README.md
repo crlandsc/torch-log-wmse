@@ -99,7 +99,3 @@ Contributions are welcome! Please open an issue or submit a pull request if you 
 ## License
 
 This project is licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
-
-
-## Acknowledgments
-Thanks to [Whitebalance](https://www.whitebalance.co/) for backing this project.
