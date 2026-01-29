@@ -103,3 +103,10 @@ Updated README to reflect 0.2.8 `bypass_filter` update.
 - Updated docstrings and comments to correctly document expected tensor shapes
 - Optimized scaling_factor broadcasting
 - Added comprehensive test for all reduction options
+
+## 0.3.1 (2026-01-29)
+
+#### Centralized version management
+- Version now only needs to be updated in one location (`torch_log_wmse/__init__.py`)
+- `setup.cfg` now references version via `attr: torch_log_wmse.__version__`
+- `torch_log_wmse_audio_quality` inherits version through import
