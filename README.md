@@ -8,7 +8,7 @@ logWMSE is a custom metric and loss function for audio signals that calculates t
 
 ## Installation
 
-[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/torch-log-wmse)](https://pypi.org/project/torch-log-wmse/) [![PyPI - Version](https://img.shields.io/pypi/v/torch-log-wmse)](https://pypi.org/project/torch-log-wmse/) [![Number of downloads from PyPI per month](https://img.shields.io/pypi/dm/torch-log-wmse)](https://pypi.org/project/torch-log-wmse/)
+[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/torch-log-wmse)](https://pypi.org/project/torch-log-wmse/) [![PyPI - Version](https://img.shields.io/pypi/v/torch-log-wmse)](https://pypi.org/project/torch-log-wmse/) [![Downloads](https://img.shields.io/pepy/dt/torch-log-wmse)](https://pepy.tech/project/torch-log-wmse)
 
 
 `pip install torch-log-wmse`
