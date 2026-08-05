@@ -437,17 +437,25 @@ class TestSilenceGradients(unittest.TestCase):
         m(u, torch.randn(1, 1, 1, n), torch.zeros(1, 1, 1, n)).backward()
         self.assertTrue(torch.isfinite(u.grad).all())
 
-    def test_silent_mixture_value_is_unchanged_by_the_rms_floor(self):
-        # A digitally silent mixture must still yield 1/RMS_EPS scaling, so the value is the same
-        # whether the epsilon is an addend or a floor.
-        from torch_log_wmse.constants import RMS_EPS
+    def test_silent_mixture_scaling_is_pinned_to_rms_eps(self):
+        """A silent mixture must scale by exactly 1/RMS_EPS, and the resulting value is pinned.
+
+        This is a value assertion rather than a NaN check on purpose. The original 0.2.8 bug was
+        1/0 -> inf -> 0*inf -> NaN, but the clamp inside calculate_rms now prevents an exactly-zero
+        RMS independently, so removing the RMS_EPS floor no longer produces NaN -- it produces a
+        WRONG NUMBER (measured -220.55 instead of -71.93). Only pinning the value catches that.
+        """
         n = 4096
         m = _metric(audio_length=n / SR, reduction="none")
         z = torch.zeros(1, 1, n)
-        est = torch.full((1, 1, 1, n), 1e-3)
-        got = float(m(z, est, torch.zeros(1, 1, 1, n)))
-        self.assertTrue(math.isfinite(got))
-        self.assertLess(got, 0.0)  # a leaky estimate against a silent mixture scores far below zero
+        t = torch.zeros(1, 1, 1, n)
+        for level, expected in ((1e-3, -71.93113), (1e-2, -90.35181)):
+            with self.subTest(level=level):
+                got = float(m(z, torch.full((1, 1, 1, n), level), t))
+                self.assertTrue(math.isfinite(got))
+                self.assertAlmostEqual(got, expected, delta=0.01)
+        # And an all-silent triplet still sits at the ceiling.
+        self.assertAlmostEqual(float(m(z, t, t)), CEILING, places=4)
 
 
 class TestInputValidation(unittest.TestCase):
@@ -592,6 +600,34 @@ class TestBundledImpulseResponse(unittest.TestCase):
         self.assertAlmostEqual(float(freqs[int((mag > -3).to(torch.int8).argmax())]), 118.0, delta=3.0)
         peak = int(mag.argmax())
         self.assertAlmostEqual(float(freqs[peak]), 2971.0, delta=60.0)
+
+
+class TestApplyReductionDirectly(unittest.TestCase):
+    """apply_reduction is public and must validate on its own.
+
+    LogWMSE validates `reduction` at construction, so the guard inside apply_reduction is never
+    reached through the metric. It is still part of the public surface, and a mutation study showed
+    that removing its `raise` was undetectable via LogWMSE alone.
+    """
+
+    def test_known_reductions(self):
+        from torch_log_wmse.utils import apply_reduction
+        x = torch.arange(6.0).reshape(2, 3)
+        self.assertTrue(torch.equal(apply_reduction(x, "none"), x))
+        self.assertAlmostEqual(float(apply_reduction(x, "mean")), float(x.mean()))
+        self.assertAlmostEqual(float(apply_reduction(x, "sum")), float(x.sum()))
+
+    def test_unknown_reduction_raises(self):
+        from torch_log_wmse.utils import apply_reduction
+        x = torch.arange(6.0).reshape(2, 3)
+        for bad in ("Mean", "average", "batchmean", "", None, 0):
+            with self.subTest(reduction=bad):
+                with self.assertRaises(ValueError):
+                    apply_reduction(x, bad)
+
+    def test_valid_reductions_constant_is_exported(self):
+        from torch_log_wmse.utils import VALID_REDUCTIONS
+        self.assertEqual(set(VALID_REDUCTIONS), {"none", "mean", "sum"})
 
 
 if __name__ == "__main__":
