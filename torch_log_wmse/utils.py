@@ -23,10 +23,28 @@ def convert_decibels_to_amplitude_ratio(decibels: Union[torch.Tensor, float]):
         decibels = torch.tensor(decibels)
     return torch.pow(10, decibels / 20)
 
-def apply_reduction(losses, reduction="none"):
-    """Apply reduction to collection of losses."""
+VALID_REDUCTIONS = ("none", "mean", "sum")
+
+
+def apply_reduction(losses: torch.Tensor, reduction: str = "none") -> torch.Tensor:
+    """Apply a reduction to a collection of losses.
+
+    Args:
+        losses (torch.Tensor): Per-[batch, channel, stem] values.
+        reduction (str): One of "none", "mean" or "sum".
+
+    Returns:
+        torch.Tensor: The reduced values, or `losses` unchanged for "none".
+
+    Raises:
+        ValueError: If `reduction` is not one of VALID_REDUCTIONS. This matters because the function
+            previously fell through silently for any unrecognised value, so a typo such as "Sum"
+            behaved as "none" and returned an unreduced tensor.
+    """
     if reduction == "mean":
-        losses = losses.mean()
-    elif reduction == "sum":
-        losses = losses.sum()
-    return losses
+        return losses.mean()
+    if reduction == "sum":
+        return losses.sum()
+    if reduction == "none":
+        return losses
+    raise ValueError(f"reduction must be one of {VALID_REDUCTIONS}, got {reduction!r}")

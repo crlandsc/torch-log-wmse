@@ -4,7 +4,7 @@ from typing import Callable, Optional
 
 from torch_log_wmse.constants import ERROR_TOLERANCE_THRESHOLD, SCALER, EPS, RMS_EPS
 from torch_log_wmse.freq_weighting_filter import HumanHearingSensitivityFilter
-from torch_log_wmse.utils import calculate_rms, apply_reduction
+from torch_log_wmse.utils import VALID_REDUCTIONS, apply_reduction, calculate_rms
 
 
 class LogWMSE(torch.nn.Module):
@@ -32,7 +32,8 @@ class LogWMSE(torch.nn.Module):
         impulse_response_sample_rate (int, optional): The sample rate of the FIR in Hz. Defaults to 44100.
         return_as_loss (bool, optional): Whether to return the loss value (i.e. negative of the metric). Defaults to True.
         bypass_filter (bool, optional): Whether to bypass the frequency weighting filter. Defaults to False.
-        reduction (str, optional): The reduction method to apply to the logWMSE values. Defaults to "mean".
+        reduction (str, optional): How to aggregate the per-[batch, channel, stem] values.
+            One of "mean" (default), "sum", or "none" to return them unreduced.
     """
     def __init__(
             self,
@@ -53,13 +54,56 @@ class LogWMSE(torch.nn.Module):
         )
         self.return_as_loss = return_as_loss
         self.bypass_filter = bypass_filter
+        if reduction not in VALID_REDUCTIONS:
+            raise ValueError(f"reduction must be one of {VALID_REDUCTIONS}, got {reduction!r}")
         self.reduction = reduction
-    def forward(self, unprocessed_audio: Tensor, processed_audio: Tensor, target_audio: Tensor):
-        assert unprocessed_audio.ndim == 3 # unprocessed_audio audio shape: [batch, channel, time]
-        assert processed_audio.ndim == 4 # processed_audio audio shape: [batch, channel, stem, time]
-        assert target_audio.ndim == 4 # target_audio audio shape: [batch, channel, stem, time]
-        assert processed_audio.shape == target_audio.shape # processed_audio and target_audio should have the same shape
-        assert processed_audio.shape[-1] == target_audio.shape[-1] == unprocessed_audio.shape[-1] # all should have the same length
+
+    def forward(self, unprocessed_audio: Tensor, processed_audio: Tensor, target_audio: Tensor) -> Tensor:
+        # Validation raises rather than asserting: `python -O` strips assert statements, and these
+        # checks are load-bearing. Without the batch/channel checks in particular, a mismatch
+        # BROADCASTS and silently returns a plausible-looking number instead of failing.
+        if unprocessed_audio.ndim != 3:
+            raise ValueError(
+                "unprocessed_audio must have shape [batch, channel, time], got "
+                f"{tuple(unprocessed_audio.shape)}"
+            )
+        for name, t in (("processed_audio", processed_audio), ("target_audio", target_audio)):
+            if t.ndim != 4:
+                raise ValueError(
+                    f"{name} must have shape [batch, channel, stem, time], got {tuple(t.shape)}"
+                )
+        if processed_audio.shape != target_audio.shape:
+            raise ValueError(
+                "processed_audio and target_audio must have the same shape, got "
+                f"{tuple(processed_audio.shape)} and {tuple(target_audio.shape)}"
+            )
+        # Batch and channel must agree with unprocessed_audio. These were previously unchecked, so a
+        # mono mixture against stereo stems (or a batch-size mismatch) broadcast silently.
+        if unprocessed_audio.shape[0] != processed_audio.shape[0]:
+            raise ValueError(
+                f"batch size mismatch: unprocessed_audio has {unprocessed_audio.shape[0]}, "
+                f"processed_audio has {processed_audio.shape[0]}"
+            )
+        if unprocessed_audio.shape[1] != processed_audio.shape[1]:
+            raise ValueError(
+                f"channel count mismatch: unprocessed_audio has {unprocessed_audio.shape[1]}, "
+                f"processed_audio has {processed_audio.shape[1]}"
+            )
+        if unprocessed_audio.shape[-1] != processed_audio.shape[-1]:
+            raise ValueError(
+                f"length mismatch: unprocessed_audio has {unprocessed_audio.shape[-1]} samples, "
+                f"processed_audio has {processed_audio.shape[-1]}"
+            )
+        # The filter truncates to the length configured at construction, so a mismatch would silently
+        # score a different window than the caller passed - and bypass_filter=True would not truncate
+        # at all, making the two paths disagree on which samples they scored.
+        expected = self.filters.audio_length_samples
+        if unprocessed_audio.shape[-1] != expected:
+            raise ValueError(
+                f"expected {expected} samples (audio_length x sample_rate as configured), got "
+                f"{unprocessed_audio.shape[-1]}. Construct a LogWMSE for this length, or trim/pad the "
+                "input to match."
+            )
 
         if self.bypass_filter:
             input_rms = calculate_rms(unprocessed_audio.unsqueeze(2))  # [batch, channel, time] -> [batch, channel, stem=1, time]

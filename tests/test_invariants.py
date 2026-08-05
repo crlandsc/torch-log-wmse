@@ -328,7 +328,9 @@ class TestGradients(unittest.TestCase):
     def test_gradcheck_in_float64(self):
         torch.manual_seed(13)
         n = 256
-        m = _metric(audio_length=n / SR, sample_rate=4096, return_as_loss=True)
+        # audio_length must be consistent with sample_rate, or the length validation rejects the input.
+        sr = 4096
+        m = _metric(audio_length=n / sr, sample_rate=sr, return_as_loss=True)
         u = (torch.rand(1, 1, n, dtype=torch.float64) * 2 - 1)
         t = (torch.rand(1, 1, 1, n, dtype=torch.float64) * 2 - 1)
         p = (torch.rand(1, 1, 1, n, dtype=torch.float64) * 2 - 1).requires_grad_(True)
@@ -446,6 +448,62 @@ class TestSilenceGradients(unittest.TestCase):
         got = float(m(z, est, torch.zeros(1, 1, 1, n)))
         self.assertTrue(math.isfinite(got))
         self.assertLess(got, 0.0)  # a leaky estimate against a silent mixture scores far below zero
+
+
+class TestInputValidation(unittest.TestCase):
+    """Shape and option mistakes must raise, not broadcast into a plausible wrong number.
+
+    These were bare `assert` statements, so `python -O` stripped them; and batch/channel agreement
+    with unprocessed_audio was never checked at all, so a mono mixture against stereo stems silently
+    broadcast and returned 18.41251.
+    """
+
+    def setUp(self):
+        self.n = 4096
+        self.m = _metric(audio_length=self.n / SR)
+        torch.manual_seed(31)
+        self.u = torch.rand(2, 2, self.n) * 2 - 1
+        self.p = torch.rand(2, 2, 3, self.n) * 2 - 1
+        self.t = torch.zeros(2, 2, 3, self.n)
+
+    def test_accepts_the_documented_shapes(self):
+        self.assertTrue(math.isfinite(float(self.m(self.u, self.p, self.t))))
+
+    def test_channel_mismatch_raises(self):
+        with self.assertRaisesRegex(ValueError, "channel count mismatch"):
+            self.m(torch.rand(2, 1, self.n), self.p, self.t)
+
+    def test_batch_mismatch_raises(self):
+        with self.assertRaisesRegex(ValueError, "batch size mismatch"):
+            self.m(torch.rand(1, 2, self.n), self.p, self.t)
+
+    def test_wrong_ndim_raises(self):
+        with self.assertRaisesRegex(ValueError, r"\[batch, channel, time\]"):
+            self.m(self.p, self.p, self.t)
+        with self.assertRaisesRegex(ValueError, r"\[batch, channel, stem, time\]"):
+            self.m(self.u, self.u, self.t)
+
+    def test_processed_target_shape_mismatch_raises(self):
+        with self.assertRaisesRegex(ValueError, "same shape"):
+            self.m(self.u, self.p, torch.zeros(2, 2, 1, self.n))
+
+    def test_length_mismatch_with_configured_audio_length_raises(self):
+        # Previously the filtered path silently scored only the first audio_length_samples while
+        # bypass_filter=True scored everything, so the two disagreed by up to 26 units.
+        longer = self.n * 2
+        with self.assertRaisesRegex(ValueError, "expected"):
+            self.m(torch.rand(2, 2, longer), torch.rand(2, 2, 3, longer), torch.zeros(2, 2, 3, longer))
+
+    def test_bad_reduction_raises_at_construction(self):
+        for bad in ("Mean", "average", "batchmean", "", None):
+            with self.subTest(reduction=bad):
+                with self.assertRaises(ValueError):
+                    _metric(audio_length=self.n / SR, reduction=bad)
+
+    def test_valid_reductions_are_accepted(self):
+        for good in ("none", "mean", "sum"):
+            with self.subTest(reduction=good):
+                _metric(audio_length=self.n / SR, reduction=good)
 
 
 if __name__ == "__main__":
