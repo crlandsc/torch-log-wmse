@@ -111,14 +111,23 @@ class LogWMSE(torch.nn.Module):
         # Add extra dimension(s) to scaling_factor to match the shape of processed_audio and target_audio
         while scaling_factor.dim() < processed_audio.dim():
             scaling_factor = scaling_factor.unsqueeze(-1)
-        
-        # Calculate the frequency-weighted differences, ignoring small imperceptible differences
-        # Skip frequency weighting if bypass_filter is True
-        if bypass_filter:
-            differences = (processed_audio * scaling_factor) - (target_audio * scaling_factor)
-        else:
-            differences = filters(processed_audio * scaling_factor) - filters(target_audio * scaling_factor)
-        differences[torch.abs(differences) < ERROR_TOLERANCE_THRESHOLD] = 0.0
+
+        # Calculate the frequency-weighted differences, ignoring small imperceptible differences.
+        # The filter is linear, so filters(a) - filters(b) == filters(a - b); taking the difference first
+        # halves the filtered signals and so removes one rfft/irfft pair per call.
+        # Skip frequency weighting if bypass_filter is True.
+        differences = (processed_audio - target_audio) * scaling_factor
+        if not bypass_filter:
+            differences = filters(differences)
+
+        # Discard differences too small to be audible. torch.where is used rather than an in-place
+        # masked assignment: it avoids a data-dependent scatter and does not materialise a full-size
+        # boolean index, which keeps the graph friendly to torch.compile.
+        differences = torch.where(
+            torch.abs(differences) < ERROR_TOLERANCE_THRESHOLD,
+            torch.zeros((), dtype=differences.dtype, device=differences.device),
+            differences,
+        )
 
         # Calculate the mean squared differences
         mean_diff = (differences**2).mean(dim=-1)
