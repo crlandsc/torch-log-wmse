@@ -2,36 +2,121 @@ name: Publish Python 🐍 distribution 📦 to PyPI and TestPyPI
 
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        description: "Where to publish"
+        type: choice
+        default: testpypi
+        options: [testpypi, pypi]
 
 jobs:
+  # Never publish something that fails its own tests. The previous workflow had no test gate.
+  test:
+    uses: ./.github/workflows/ci.yml
+
   build:
-    name: Build and publish Python 🐍 distributions 📦 to PyPI and TestPyPI
+    name: Build both distributions
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip build twine
+
+      # torch_log_wmse/__init__.py is the single source of truth. Read it WITHOUT importing, so the
+      # build does not need torch installed.
+      - name: Resolve version
+        id: ver
+        run: |
+          VERSION=$(grep -oE '"[0-9]+\.[0-9]+\.[0-9]+"' torch_log_wmse/__init__.py | head -1 | tr -d '"')
+          test -n "$VERSION" || { echo "could not resolve version"; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building version $VERSION"
+
+      # The real distribution: ships torch_log_wmse AND the torch_log_wmse_audio_quality shim, so both
+      # import names work from a single install. Each build writes to its own outdir, so no upload can
+      # ever re-send the other distribution's artifacts.
+      - name: Build torch-log-wmse
+        run: |
+          rm -rf dist build
+          python -m build --outdir dist/main
+
+      # The legacy name: metadata only, depending on the real distribution. Shipping no files is what
+      # stops the two distributions owning the same paths. See packaging/alias/README.md.
+      - name: Build torch-log-wmse-audio-quality
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          python - <<'PY'
+          import os, pathlib, re
+          v = os.environ["VERSION"]
+          p = pathlib.Path("packaging/alias/pyproject.toml")
+          s = p.read_text()
+          s = re.sub(r'^version = ".*"$', f'version = "{v}"', s, count=1, flags=re.M)
+          s = re.sub(r'^dependencies = \["torch-log-wmse"\]$',
+                     f'dependencies = ["torch-log-wmse=={v}"]', s, count=1, flags=re.M)
+          p.write_text(s)
+          print(f"pinned alias to torch-log-wmse=={v}")
+          PY
+          cd packaging/alias && python -m build --outdir ../../dist/alias
+
+      - name: Verify the two distributions do not overlap
+        run: |
+          python - <<'PY'
+          import glob, zipfile, sys
+          def payload(whl):
+              with zipfile.ZipFile(whl) as z:
+                  return {n for n in z.namelist() if ".dist-info/" not in n}
+          main = payload(glob.glob("dist/main/*.whl")[0])
+          alias = payload(glob.glob("dist/alias/*.whl")[0])
+          print("main  payload files:", len(main))
+          print("alias payload files:", len(alias), sorted(alias))
+          if alias:
+              sys.exit(f"FAIL: the alias distribution must ship no code, got {sorted(alias)}")
+          overlap = main & alias
+          if overlap:
+              sys.exit(f"FAIL: both distributions claim {sorted(overlap)}")
+          print("OK: alias is metadata-only, no file overlap")
+          PY
+
+      - name: twine check
+        run: python -m twine check dist/main/* dist/alias/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to ${{ inputs.target }}
+    needs: build
     runs-on: ubuntu-latest
     environment:
       name: production
       url: https://pypi.org/p/torch-log-wmse
     permissions:
-      id-token: write  # IMPORTANT: mandatory for trusted publishing
+      id-token: write # trusted publishing; no long-lived API token on a command line
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python 3.8
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.8"
-    - name: Install pypa/build and twine
-      run: |
-        python3 -m pip install build twine --user
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
 
-    - name: Build and publish torch-log-wmse-audio-quality
-      run: |
-        sed -i 's/name = .*/name = torch-log-wmse-audio-quality/' setup.cfg
-        python3 -m build
-        python3 -m twine upload --repository-url https://test.pypi.org/legacy/ -u __token__ -p ${{ secrets.TEST_PYPI_API_KEY }} dist/*
-        python3 -m twine upload --repository-url https://upload.pypi.org/legacy/ -u __token__ -p ${{ secrets.PYPI_API_KEY }} dist/*
+      # Trusted publishing (OIDC) rather than `-p ${{ secrets.* }}`. Each distribution uploads from
+      # its own directory, so one upload cannot re-send the other's files.
+      - name: Publish torch-log-wmse
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/main/
+          repository-url: ${{ inputs.target == 'pypi' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
 
-    - name: Build and publish torch-log-wmse
-      run: |
-        sed -i 's/name = .*/name = torch-log-wmse/' setup.cfg
-        python3 -m build
-        python3 -m twine upload --repository-url https://test.pypi.org/legacy/ -u __token__ -p ${{ secrets.TEST_PYPI_API_KEY }} dist/*
-        python3 -m twine upload --repository-url https://upload.pypi.org/legacy/ -u __token__ -p ${{ secrets.PYPI_API_KEY }} dist/*
+      - name: Publish torch-log-wmse-audio-quality
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/alias/
+          repository-url: ${{ inputs.target == 'pypi' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}

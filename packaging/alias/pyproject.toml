@@ -1,0 +1,31 @@
+# Metadata-only distribution for the legacy package name. Ships NO code: it exists so that
+# `pip install torch-log-wmse-audio-quality` keeps working, and it depends on the real
+# distribution rather than duplicating its files. See README.md in this directory.
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torch-log-wmse-audio-quality"
+# Replaced at build time from torch_log_wmse/__init__.py, the single source of truth.
+version = "0.0.0"
+authors = [{ name = "Christopher Landschoot", email = "crlandschoot@gmail.com" }]
+description = "Legacy name for torch-log-wmse. Installs torch-log-wmse, which provides both import names."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache License 2.0" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+]
+# The whole point: depend on the real distribution instead of shipping a second copy of it.
+dependencies = ["torch-log-wmse"]
+
+[project.urls]
+Homepage = "https://github.com/crlandsc/torch-log-wmse"
+"Bug Tracker" = "https://github.com/crlandsc/torch-log-wmse/issues"
+
+# Ship no packages and no modules.
+[tool.setuptools]
+packages = []
