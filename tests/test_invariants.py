@@ -506,5 +506,93 @@ class TestInputValidation(unittest.TestCase):
                 _metric(audio_length=self.n / SR, reduction=good)
 
 
+class TestBundledImpulseResponse(unittest.TestCase):
+    """The bundled FIR must load without a code-execution format, and must be the designed filter.
+
+    It used to ship as a pickle, which `pickle.load` deserialises by resolving and calling arbitrary
+    dotted global names, with no validation of the result. It is now raw float32 with a pinned length
+    and digest. These tests also serve as the provenance check: rather than trusting an opaque blob,
+    they assert the filter's measured frequency response against the corners it was designed to have
+    (120 Hz high-pass, 500 Hz +2.5 dB peak, 1500 Hz +5 dB shelf, 10 kHz low-pass).
+    """
+
+    def test_loads_with_expected_shape_and_dtype(self):
+        from torch_log_wmse.freq_weighting_filter import load_bundled_impulse_response
+        ir = load_bundled_impulse_response()
+        self.assertEqual(ir.ndim, 1)
+        self.assertEqual(ir.numel(), 4000)
+        self.assertEqual(ir.dtype, torch.float32)
+        self.assertTrue(torch.isfinite(ir).all())
+
+    def test_integrity_check_is_enforced(self):
+        from torch_log_wmse import freq_weighting_filter as fwf
+        original = fwf._IR_SHA256
+        try:
+            fwf._IR_SHA256 = "0" * 64
+            with self.assertRaisesRegex(ValueError, "integrity check"):
+                fwf.load_bundled_impulse_response()
+        finally:
+            fwf._IR_SHA256 = original
+        # and it still loads once restored
+        self.assertEqual(fwf.load_bundled_impulse_response().numel(), 4000)
+
+    def test_no_deserialisation_format_is_used(self):
+        """Regression guard: the loader must not reintroduce a code-execution format.
+
+        Checked against the parsed AST rather than the source text, so prose in comments and
+        docstrings that merely mentions these names does not trip it.
+        """
+        import ast
+        import inspect
+        from torch_log_wmse import freq_weighting_filter as fwf
+
+        tree = ast.parse(inspect.getsource(fwf))
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[0])
+        for banned in ("pickle", "dill", "joblib", "marshal", "shelve"):
+            self.assertNotIn(banned, imported, f"{banned} reintroduced into the filter module")
+
+        called = {
+            ast.unparse(node.func)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and not isinstance(node.func, ast.Name)
+        }
+        for banned in ("pickle.load", "pickle.loads", "torch.load", "numpy.load", "np.load"):
+            self.assertNotIn(banned, called, f"{banned} reintroduced into the filter module")
+
+    def test_is_symmetric_about_its_centre(self):
+        # A zero-phase FIR must be symmetric; the shift compensation assumes a centre at (M-1)//2.
+        from torch_log_wmse.freq_weighting_filter import load_bundled_impulse_response
+        h = load_bundled_impulse_response()
+        k = torch.arange(1, 2000)
+        self.assertLess(float((h[1999 + k] - h[1999 - k]).abs().max()), 1e-7)
+        self.assertEqual(int(h.abs().argmax()), 1999)
+
+    def test_frequency_response_matches_the_designed_curve(self):
+        """Provenance check: the response corners must match the documented filter design."""
+        from torch_log_wmse.freq_weighting_filter import load_bundled_impulse_response
+        h = load_bundled_impulse_response()
+        n = 1 << 16
+        mag = 20 * torch.log10(torch.clamp_min(torch.fft.rfft(h, n).abs(), 1e-12))
+        freqs = torch.fft.rfftfreq(n, 1 / SR)
+
+        def at(hz):
+            return float(mag[int(torch.argmin((freqs - hz).abs()))])
+
+        # Designed: 120 Hz high-pass, 500 Hz +2.5 dB peak, 1500 Hz +5 dB shelf, 10 kHz low-pass.
+        for hz, expected in ((20, -30.97), (50, -15.39), (120, -2.89), (500, 2.53),
+                             (1000, 1.49), (3000, 4.24), (10000, -1.02), (20000, -30.94)):
+            with self.subTest(hz=hz):
+                self.assertAlmostEqual(at(hz), expected, delta=0.15)
+        # -3 dB corners bracket the passband.
+        self.assertAlmostEqual(float(freqs[int((mag > -3).to(torch.int8).argmax())]), 118.0, delta=3.0)
+        peak = int(mag.argmax())
+        self.assertAlmostEqual(float(freqs[peak]), 2971.0, delta=60.0)
+
+
 if __name__ == "__main__":
     unittest.main()

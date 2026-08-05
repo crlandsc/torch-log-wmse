@@ -6,13 +6,56 @@ FFT convolution in place of scipy.signal.oaconvolve, batched [batch, channel, st
 API, differentiable loss support, and the impulse-response/silence handling described in the
 README and CHANGELOG.
 """
+import hashlib
+import math
+from importlib.resources import files
+from typing import Optional
+
 import torch
 from torch import Tensor
 from torchaudio.transforms import Resample
-import importlib.resources as resources
-import pickle
-import math
-from typing import Optional
+
+# Raw little-endian float32 samples of the bundled hearing-sensitivity FIR. Previously a pickle, which
+# is a code-execution format: `pickle.load` resolves arbitrary dotted global names and calls them, and
+# nothing validated what came back. A flat array needs none of that, and dropping the pickle also
+# removes numpy as a runtime dependency -- it was required only to reconstruct the pickled ndarray, and
+# is not imported anywhere in this package.
+#
+# The bytes are the float32 cast of the original float64 pickle, which is exactly what the old loader
+# produced (verified bitwise equal), so metric values are unchanged.
+_IR_RESOURCE = "filter_ir.f32"
+_IR_TAPS = 4000
+_IR_SHA256 = "bc9950e4f6be2846bf178017a5cca1e5407244d7b255d60de17b882f304998ab"
+
+
+def load_bundled_impulse_response(verify: bool = True) -> Tensor:
+    """Load the bundled human-hearing-sensitivity impulse response.
+
+    Args:
+        verify: If True (default), check the payload length and SHA-256 against the values pinned
+            above. This is an integrity check against a corrupted or truncated install, not a
+            security boundary -- anyone who can modify the resource can modify this module too. It is
+            worth having because a silently truncated response would still "work": an all-zero or
+            short FIR produces plausible numbers rather than an error.
+
+    Returns:
+        Tensor: 1-D float32 tensor of `_IR_TAPS` samples.
+    """
+    data = files("torch_log_wmse").joinpath(_IR_RESOURCE).read_bytes()
+    if verify:
+        expected_bytes = _IR_TAPS * 4
+        if len(data) != expected_bytes:
+            raise ValueError(
+                f"{_IR_RESOURCE} should be {expected_bytes} bytes ({_IR_TAPS} float32 samples), "
+                f"got {len(data)}. The install looks corrupt."
+            )
+        digest = hashlib.sha256(data).hexdigest()
+        if digest != _IR_SHA256:
+            raise ValueError(
+                f"{_IR_RESOURCE} failed its integrity check: expected sha256 {_IR_SHA256}, got {digest}."
+            )
+    # bytearray() because frombuffer requires a writable buffer; the copy is 16 KB and happens once.
+    return torch.frombuffer(bytearray(data), dtype=torch.float32)
 
 
 def prepare_impulse_response_fft(impulse_response, fft_size):
@@ -102,8 +145,7 @@ class HumanHearingSensitivityFilter:
         ):
         # Load the impulse response if not provided
         if impulse_response is None:
-            with resources.open_binary("torch_log_wmse", "filter_ir.pkl") as f:
-                impulse_response = torch.tensor(pickle.load(f), dtype=torch.float32)
+            impulse_response = load_bundled_impulse_response()
 
         # Resample the impulse response if necessary
         if impulse_response_sample_rate != sample_rate:
