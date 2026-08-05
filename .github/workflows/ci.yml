@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: py${{ matrix.python }} / ${{ matrix.numpy }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Mirrors upstream's matrix: one numpy 1.x leg and one numpy 2.x leg, because the bundled
+        # filter_ir.pkl unpickles through numpy.core.multiarray._reconstruct and numpy 2 renamed
+        # numpy.core to numpy._core. The compat shim is what keeps that working, so both legs matter.
+        include:
+          - python: "3.10"
+            numpy: "numpy>=1.23.5,<2"
+          - python: "3.11"
+            numpy: "numpy>=2,<3"
+          - python: "3.12"
+            numpy: "numpy>=2,<3"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install dependencies
+        env:
+          NUMPY_SPEC: ${{ matrix.numpy }}
+        run: |
+          python -m pip install --upgrade pip wheel
+          # CPU-only torch keeps the runner fast and avoids pulling CUDA wheels.
+          pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
+          pip install "$NUMPY_SPEC"
+          pip install pytest
+          # Optional reference implementation, so the upstream-parity tests actually run rather
+          # than skipping. It pulls scipy and soxr.
+          pip install log-wmse-audio-quality
+
+      - name: Show resolved versions
+        run: |
+          python -c "import sys, torch, torchaudio, numpy; print('python', sys.version)"
+          python -c "import torch, torchaudio, numpy; print('torch', torch.__version__, '| torchaudio', torchaudio.__version__, '| numpy', numpy.__version__)"
+
+      - name: Run tests
+        run: pytest -q
+
+  build:
+    name: build sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build and check
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          # Catches malformed metadata and a broken long_description before it reaches PyPI,
+          # which the publish workflow does not do.
+          python -m twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

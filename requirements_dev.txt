@@ -3,3 +3,7 @@ torchaudio>=1.8.0
 numpy>=1.23.5
 matplotlib==3.7.5
 pytest>=7
+
+# Optional: enables the upstream numerical-parity tests in tests/test_upstream_parity.py.
+# Pulls scipy and soxr. The tests skip cleanly without it.
+log-wmse-audio-quality>=0.2.0

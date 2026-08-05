@@ -7,31 +7,27 @@ import math
 from typing import Optional
 
 
-def prepare_impulse_response_fft(impulse_response, fft_size, symmetric_ir=True):
+def prepare_impulse_response_fft(impulse_response, fft_size):
     """
     Prepares the FFT of the impulse response for convolution.
+
+    The impulse response is centre-padded, which pairs with the group-delay compensation in
+    HumanHearingSensitivityFilter.__call__ to make the filter zero-phase.
 
     Args:
     - impulse_response: The impulse response signal, a 1D tensor of shape [kernel_size].
     - fft_size: The size of FFT to use, typically a power of two that is at least
                 as large as the sum of the signal length and kernel_size minus one.
-    - symmetric_ir: Whether the impulse response is symmetric (used for circular shifting).
-                If True, padding will be symmetric, if False, padding will be to the right.
-                Defaults to True.
 
     Returns:
     - A complex tensor of shape [1, 1, fft_size // 2 + 1] (three dimensions, dtype complex64 for a
       float32 impulse response) holding the half-spectrum of the impulse response, shaped for
       broadcasting across batch, channel and stem axes during convolution.
     """
-    # Pad the impulse response to FFT size (N+M-1)
+    # Centre-pad the impulse response to FFT size (N+M-1)
     total_padding = fft_size - impulse_response.shape[-1]
-    if symmetric_ir:
-        left_padding = total_padding // 2
-        right_padding = total_padding - left_padding
-    else:
-        left_padding = 0
-        right_padding = total_padding
+    left_padding = total_padding // 2
+    right_padding = total_padding - left_padding
     impulse_response = torch.nn.functional.pad(impulse_response, (left_padding, right_padding))
 
     # Compute the FFT of the impulse response
@@ -51,6 +47,8 @@ def fft_convolve(audio_batch, impulse_response_fft, fft_size):
     - audio_batch: A batch of time-domain audio signals.
                    Expected shape: [batch, channel, signal_length] or [batch, channel, stem, signal_length].
     - impulse_response_fft: The precomputed FFT of the impulse response (frequency domain), with shape [1, 1, fft_size // 2 + 1].
+    - fft_size: The FFT size the impulse response was prepared at. The audio must already be padded
+                to this length.
 
     Returns:
     - A tensor of convolved audio signals with the same shape as audio_batch.
@@ -80,16 +78,12 @@ class HumanHearingSensitivityFilter:
         impulse_response_fft (torch.Tensor): The FFT of the impulse response used for efficient convolution.
         fft_size (int): The size of the FFT used for convolution. Signals will be padded to this size.
         audio_length_samples (int): The length of the audio signal in samples.
-        symmetric_ir: Whether the impulse response is symmetric (used for circular shifting).
-                    If True, IR will be padded symmetrically, if False, padding will be to the right.
-                    Defaults to True.
 
     Args:
         audio_length (float): The length of the audio signal in seconds. May be fractional.
         sample_rate (int, optional): The sample rate of the audio signal in Hz. Defaults to 44100.
         impulse_response (torch.Tensor, optional): The FIR filter for frequency weighting.
         impulse_response_sample_rate (int, optional): The sample rate of the FIR in Hz. Defaults to 44100.
-        symmetric_ir (bool, optional): Whether the impulse response is symmetric (used for circular shifting). Defaults to True.
     """
     def __init__(
             self,
@@ -97,7 +91,6 @@ class HumanHearingSensitivityFilter:
             sample_rate: int = 44100,
             impulse_response: Optional[torch.Tensor] = None,
             impulse_response_sample_rate: int = 44100,
-            symmetric_ir: bool = True,
         ):
         # Load the impulse response if not provided
         if impulse_response is None:
@@ -139,10 +132,7 @@ class HumanHearingSensitivityFilter:
         # Compute the FFT of the impulse response (will be padded to fft_size before FFT).
         # Note this uses the squeezed, validated IR - passing the raw argument here would reintroduce
         # the rank mismatch the validation above exists to prevent.
-        self.symmetric_ir = symmetric_ir
-        self.impulse_response_fft = prepare_impulse_response_fft(
-            self.impulse_response, self.fft_size, symmetric_ir=self.symmetric_ir
-        )
+        self.impulse_response_fft = prepare_impulse_response_fft(self.impulse_response, self.fft_size)
 
 
     def __call__(self, audio: Tensor) -> Tensor:
@@ -181,8 +171,7 @@ class HumanHearingSensitivityFilter:
         #   left_padding + (M - 1) // 2   where   left_padding = (fft_size - M) // 2,
         # which simplifies to fft_size // 2 - 1 for BOTH even and odd M. This matches the offset
         # scipy.signal.oaconvolve(..., "same") uses upstream, so the two agree at any IR length.
-        if self.symmetric_ir:
-            shift = self.fft_size // 2 - 1
-            filtered_audio = torch.roll(filtered_audio, -shift, dims=-1)
+        shift = self.fft_size // 2 - 1
+        filtered_audio = torch.roll(filtered_audio, -shift, dims=-1)
 
         return filtered_audio[..., :self.audio_length_samples]

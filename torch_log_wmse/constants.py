@@ -1,8 +1,5 @@
 from torch_log_wmse.utils import convert_decibels_to_amplitude_ratio
 
-# FFT size for human hearing sensitivity filter impulse response calculation
-N_FFT = 4096
-
 # Error tolerance threshold, relative to 0 dB RMS
 ERROR_TOLERANCE_THRESHOLD = convert_decibels_to_amplitude_ratio(-68.0)
 
