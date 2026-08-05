@@ -6,10 +6,12 @@ import sys
 # suite would silently test the installed wheel instead of the code under edit.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import math
 import unittest
 import torch
-import numpy as np
-import matplotlib.pyplot as plt
+# No numpy and no matplotlib at module scope. The package itself needs neither, so requiring them to
+# COLLECT the suite means the suite cannot run in a bare install of what it is testing. matplotlib is
+# imported lazily inside the one plotting block that uses it (disabled by default).
 from torch_log_wmse import LogWMSE
 from torch_log_wmse.utils import calculate_rms, convert_decibels_to_amplitude_ratio
 from torch_log_wmse.freq_weighting_filter import prepare_impulse_response_fft, HumanHearingSensitivityFilter
@@ -148,15 +150,16 @@ class TestLogWMSELoss(unittest.TestCase):
             for j in range(3):
                 with self.subTest(i=i, j=j):
                     torch.manual_seed((i+1)*(j+1))  # Ensure reproducibility
-                    np.random.seed((i+1)*(j+1))  # to make the test reproducible
 
-                    # Generate random inputs
+                    # Generate random inputs. torch.rand rather than np.random.rand: same U[0,1)
+                    # float32 draw, and this test only asserts the return type and rank, so the
+                    # generator identity is immaterial.
                     audio_lengths_samples = int(audio_length * 44100)
                     # Create [batch=1, channel=2, time] tensor for unprocessed_audio
-                    unprocessed_audio = torch.from_numpy(np.random.rand(channels, audio_lengths_samples).astype(np.float32))[None, ...]  # [1, 2, time]
+                    unprocessed_audio = torch.rand(channels, audio_lengths_samples)[None, ...]  # [1, 2, time]
                     # Create [batch=1, channel=2, stem=4, time] tensors for processed/target audio
-                    processed_audio = torch.from_numpy(np.random.rand(channels, audio_lengths_samples).astype(np.float32))[None, :, None, :].repeat(1, 1, stems, 1)  # [1, 2, 4, time]
-                    target_audio = torch.from_numpy(np.random.rand(channels, audio_lengths_samples).astype(np.float32))[None, :, None, :].repeat(1, 1, stems, 1)  # [1, 2, 4, time]
+                    processed_audio = torch.rand(channels, audio_lengths_samples)[None, :, None, :].repeat(1, 1, stems, 1)  # [1, 2, 4, time]
+                    target_audio = torch.rand(channels, audio_lengths_samples)[None, :, None, :].repeat(1, 1, stems, 1)  # [1, 2, 4, time]
 
                     loss = log_wmse_loss(unprocessed_audio, processed_audio, target_audio)
 
@@ -236,8 +239,10 @@ class TestFreqWeightingFilter(unittest.TestCase):
         self.sample_rate = 44100
         self.audio_length = 3.7516936
         tone = 440 # sine wave in Hz
-        t = np.arange(0, int(self.audio_length*self.sample_rate)) / self.sample_rate
-        self.audio = torch.tensor(0.5 * np.sin(2 * np.pi * tone * t)) # create sine wave
+        # float64 deliberately, matching what numpy produced here before: it keeps this test exercising
+        # the filter's dtype promotion against a float32 impulse response.
+        t = torch.arange(int(self.audio_length*self.sample_rate), dtype=torch.float64) / self.sample_rate
+        self.audio = 0.5 * torch.sin(2 * math.pi * tone * t) # create sine wave
         # Shape to [batch=1, channel=1, stem=1, time]
         self.audio = self.audio[None, None, None, :]
 
@@ -262,6 +267,8 @@ class TestFreqWeightingFilter(unittest.TestCase):
 
         # Plot the first 1000 samples before and after filtering
         if self.plot_output:
+            import matplotlib.pyplot as plt  # local: an interactive-debug aid, not a test dependency
+
             fig, axs = plt.subplots(2, 1, figsize=(12, 8))
             axs[0].plot(self.audio.squeeze()[:plot_upper_bound])
             axs[0].set_title(f'Original Audio (First {plot_upper_bound} Samples)')

@@ -69,6 +69,40 @@ jobs:
       - name: Run tests
         run: pytest -q
 
+  # The legs above all install the optional reference implementation, which drags in numpy via scipy.
+  # That masks a whole class of bug: a test module importing something the package itself does not
+  # depend on. A matplotlib import at module scope in tests/test_metric.py broke all three legs at
+  # COLLECTION while passing locally, purely because the dev environment happened to have it. This job
+  # is the guard: torch plus pytest and nothing else, so the suite must run against a bare install of
+  # what it is testing, with the parity module skipping rather than erroring.
+  bare:
+    name: bare (no numpy, no matplotlib, no reference impl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install torch and pytest only
+        run: |
+          python -m pip install --upgrade pip wheel
+          pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
+          pip install pytest
+          # Deterministic bareness: uninstall rather than trust that torch never pulls numpy in
+          # transitively. torch works without numpy (it warns, which is benign).
+          pip uninstall -y numpy matplotlib || true
+      - name: Assert the environment really is bare
+        run: |
+          python - <<'EOF'
+          import importlib.util, sys
+          for mod in ("numpy", "matplotlib", "log_wmse_audio_quality"):
+              if importlib.util.find_spec(mod) is not None:
+                  sys.exit(f"{mod} is importable, so this leg is not testing what it claims")
+          print("bare: numpy, matplotlib, log_wmse_audio_quality all absent")
+          EOF
+      - name: Run tests
+        run: pytest -q -rs
+
   build:
     name: build sdist + wheel
     runs-on: ubuntu-latest

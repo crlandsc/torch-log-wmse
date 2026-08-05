@@ -19,7 +19,6 @@ import math
 import os
 import sys
 
-import numpy as np
 import torch
 
 # insert(0, ...) not append, so the working tree wins over any pip-installed copy of this package.
@@ -31,9 +30,15 @@ from torch_log_wmse import LogWMSE
 
 torch.set_num_threads(2)
 
+# numpy is imported HERE, not at module scope: it arrives with the reference package (via scipy) and is
+# only ever used to talk to it. Importing it at module scope made this module fail COLLECTION in a bare
+# environment instead of skipping, contradicting the docstring above.
 try:
+    import numpy as np
+
     from log_wmse_audio_quality import calculate_log_wmse as _upstream
 except ImportError:  # pragma: no cover - exercised only when the optional dep is absent
+    np = None
     _upstream = None
 
 SR = 44100
