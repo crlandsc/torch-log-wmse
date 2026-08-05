@@ -24,7 +24,7 @@ class LogWMSE(torch.nn.Module):
     * Tailored specifically for audio signals.
 
     Args:
-        audio_length (int): The length of the audio signal in seconds.
+        audio_length (float): The length of the audio signal in seconds. May be fractional.
         sample_rate (int, optional): The sample rate of the audio signal in Hz. Defaults to 44100.
         impulse_response (Tensor, optional): The finite impulse response (FIR) filter for
             frequency weighting. If None (default), use built-in FIR. Currently only supports
@@ -36,7 +36,7 @@ class LogWMSE(torch.nn.Module):
     """
     def __init__(
             self,
-            audio_length: int,
+            audio_length: float,
             sample_rate: int = 44100,
             impulse_response: Optional[Tensor] = None,
             impulse_response_sample_rate: int = 44100,

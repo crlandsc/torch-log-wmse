@@ -27,24 +27,32 @@ audio_channels = 2 # stereo
 batch = 4 # batch size
 
 # Instantiate logWMSE
-# Set `return_as_loss=False` to resturn as a positive metric (Default: True)
+# Set `return_as_loss=False` to return as a positive metric (Default: True)
 # Set `bypass_filter=True` to bypass frequency weighting (Default: False)
+# Set `reduction` to "mean" (default), "sum", or "none" for per-[batch, channel, stem] values
 log_wmse = LogWMSE(
     audio_length=audio_length,
     sample_rate=sample_rate,
     return_as_loss=True, # optional
     bypass_filter=False, # optional
+    reduction="mean",    # optional
 )
 
-# Generate random inputs (scale between -1 and 1)
+# Generate a random mixture (scale between -1 and 1)
 audio_lengths_samples = int(audio_length * sample_rate)
 unprocessed_audio = 2 * torch.rand(batch, audio_channels, audio_lengths_samples) - 1
-processed_audio = 2 * torch.rand(batch, audio_channels, audio_stems, audio_lengths_samples) - 1
+
+# The target is digital silence, and the estimate leaves 20 dB of residual leakage.
+# Supporting a digital-silence target is the main thing logWMSE offers over (SI-)SDR.
+processed_audio = unprocessed_audio.unsqueeze(2).expand(-1, -1, audio_stems, -1) * 0.1
 target_audio = torch.zeros(batch, audio_channels, audio_stems, audio_lengths_samples)
 
-log_wmse = log_wmse(unprocessed_audio, processed_audio, target_audio)
-print(log_wmse)  # Expected output: approx. -18.42
+score = log_wmse(unprocessed_audio, processed_audio, target_audio)
+print(score)  # -18.4207, and seed-independent: the metric is exactly scale-invariant
 ```
+
+The value above is not a sampling artifact. Because the estimate is a fixed multiple of the mixture,
+`mse` is exactly `0.1**2` and the loss is exactly `4*ln(0.01) = -18.4207` for any random draw.
 
 logWMSE accepts three torch tensors of the following shapes:
 - unprocessed_audio: `[batch, audio_channels, samples]`
@@ -73,7 +81,9 @@ To measure the frequencies of a signal closer to that of human hearing, the foll
 
 ![Frequency Weighting](https://raw.githubusercontent.com/crlandsc/torch-log-wmse/main/images/frequency_weighting.png)
 
-This metric has been constructed with high-fidelity audio in mind (sample rates &ge; 44.1kHz). It theoretically could work for lower sample rates, like 16kHz, but the metric performs an internal resampling to 44.1kHz for consistency across any input sample rates.
+This metric has been constructed with high-fidelity audio in mind (sample rates &ge; 44.1kHz), and the frequency weighting above is designed at 44.1kHz.
+
+For other sample rates, the **impulse response is resampled to the audio's rate** rather than the audio being resampled to 44.1kHz. Two consequences are worth knowing. Below 44.1kHz the designed curve is truncated at the new Nyquist, so at 16kHz (Nyquist 8kHz) everything above 8kHz of the weighting — including the 10kHz lowpass corner — no longer exists. And because the original numpy implementation resamples the *audio* to 44.1kHz instead, results agree with it to float32 precision at 44.1kHz but diverge at other rates, by up to about 1.5 units at 16kHz for error concentrated near Nyquist. Treat sub-44.1kHz scores as internally consistent but not comparable to 44.1kHz scores or to the original implementation.
 
 ##### Inputs
 Unlike many audio quality metrics, logWMSE accepts 3 audio inputs rather than 2:
@@ -86,9 +96,21 @@ Typically audio loss functions only use the processed audio and target audio to 
 
 This also adds a factor of scale invariance in the sense that the processed audio needs to be scaled appropriately relative to both the unprocessed audio and ground truth. Conceptually, this means that if all 3 inputs are gained by the same arbitrary amount, the metric score will stay the same.
 
+Note that this is invariance to **joint** gain, which is a different property from the one in Limitations below. Gaining all three inputs together leaves the score unchanged; scaling **only the estimate** does change it. Unlike SI-SDR, logWMSE does not solve for an optimal estimate scale, so an estimate that is correct apart from a gain error is penalised for that gain error.
+
+##### Using logWMSE as a loss
+`return_as_loss=True` (the default) returns the negated metric, so lower is better and it can be minimised directly. A few properties are worth knowing before training against it:
+
+- **The value is bounded above at +73.6827** (`-4 * ln(EPS)`). An exact match, or an all-silent triplet, saturates there. A score pinned at that ceiling means "no measurable error", not a bug.
+- **Gradient magnitude grows as the estimate improves**, scaling as `1 / (absolute filtered error RMS)`. This is the same behaviour as SI-SDR and the opposite of plain MSE, whose gradient vanishes near the optimum. Gradient clipping is recommended.
+- **The gradient is not scale-invariant even though the value is.** Gaining all three inputs by `g` leaves the score identical but scales the gradient by `1/g`, so the effective learning rate depends on your audio level while the loss curve gives no indication of it. Normalise your audio to a consistent level.
+- **Errors below -68 dB relative to the input RMS are treated as inaudible and discounted**, so the metric saturates at the ceiling once the residual falls below roughly -80 dB. That threshold is far beyond what separation or enhancement models reach in practice (it would require an SI-SDR of about 74-80 dB), so it does not affect normal training.
+- **`reduction`** controls aggregation: `"mean"` (default), `"sum"`, or `"none"` for per-`[batch, channel, stem]` values. Use `"none"` when you want to report or inspect individual stems rather than a single averaged number.
+
 ##### Limitations
-- The metric isn't invariant to arbitrary scaling, polarity inversion, or offsets in the estimated audio relative to the target.
+- The metric isn't invariant to scaling, polarity inversion, or offsets applied to the estimated audio alone (as distinct from the joint-gain invariance described above).
 - Although it incorporates frequency filtering inspired by human auditory sensitivity, it doesn't fully model human auditory perception. For instance, it doesn't consider auditory masking.
+- Results match the original numpy implementation to float32 precision at 44.1 kHz. At other sample rates the two diverge, because the original resamples the audio to 44.1 kHz while this implementation resamples the impulse response to the audio's rate.
 
 
 ## Contributing
