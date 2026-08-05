@@ -16,7 +16,11 @@ import sys
 
 import torch
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# insert(0, ...) not append: with append, a pip-installed copy of this package in
+# site-packages shadows the working tree when this file is run directly
+# (python tests/test_x.py puts tests/ on sys.path[0], not the repo root), so the
+# suite would silently test the installed wheel instead of the code under edit.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import unittest
 
@@ -210,7 +214,9 @@ class TestScaleInvariance(unittest.TestCase):
         t = (torch.rand(1, 1, 1, n) * 2 - 1) * 0.3
         p = t + torch.randn_like(t) * 0.01
         ref = float(m(u, p, t))
-        for g in (1e-3, 1e-2, 1e-1, 1e1, 1e2, 1e3):
+        # Includes 1e-5 and 1e-4, where an ADDITIVE rms epsilon biased the result (+0.0014 at 1e-4).
+        # RMS_EPS is a floor, so invariance is exact to float32 noise across every decade here.
+        for g in (1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e1, 1e2, 1e3):
             with self.subTest(gain=g):
                 self.assertAlmostEqual(float(m(u * g, p * g, t * g)), ref, places=3)
 
@@ -352,9 +358,6 @@ class TestDigitalSilence(unittest.TestCase):
         self.assertAlmostEqual(float(out.flatten()[0]), CEILING, places=4)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestImpulseResponseValidation(unittest.TestCase):
     """A malformed impulse response must raise, not silently corrupt every result.
@@ -409,3 +412,41 @@ class TestImpulseResponseValidation(unittest.TestCase):
         u = (torch.rand(1, 1, n) * 2 - 1)
         p = (torch.rand(1, 1, 1, n) * 2 - 1) * 0.1
         self.assertTrue(math.isfinite(float(m(u, p, torch.zeros_like(p)))))
+
+class TestSilenceGradients(unittest.TestCase):
+    """A digitally silent, grad-requiring input must not poison the graph.
+
+    calculate_rms takes sqrt of a mean square; at exactly zero sqrt has infinite derivative, so the
+    forward value stayed finite (RMS_EPS is applied afterwards) while the backward pass produced NaN.
+    Reachable when the "unprocessed" signal is an upstream module's output in a cascaded system.
+    """
+
+    def test_rms_gradient_at_exact_zero_is_finite(self):
+        from torch_log_wmse.utils import calculate_rms
+        z = torch.zeros(1, 1, 1, 16, requires_grad=True)
+        calculate_rms(z).sum().backward()
+        self.assertTrue(torch.isfinite(z.grad).all())
+        self.assertEqual(float(z.grad.abs().max()), 0.0)
+
+    def test_grad_requiring_silent_mixture_does_not_produce_nan(self):
+        n = 4096
+        u = torch.zeros(1, 1, n, requires_grad=True)
+        m = _metric(audio_length=n / SR, return_as_loss=True)
+        m(u, torch.randn(1, 1, 1, n), torch.zeros(1, 1, 1, n)).backward()
+        self.assertTrue(torch.isfinite(u.grad).all())
+
+    def test_silent_mixture_value_is_unchanged_by_the_rms_floor(self):
+        # A digitally silent mixture must still yield 1/RMS_EPS scaling, so the value is the same
+        # whether the epsilon is an addend or a floor.
+        from torch_log_wmse.constants import RMS_EPS
+        n = 4096
+        m = _metric(audio_length=n / SR, reduction="none")
+        z = torch.zeros(1, 1, n)
+        est = torch.full((1, 1, 1, n), 1e-3)
+        got = float(m(z, est, torch.zeros(1, 1, 1, n)))
+        self.assertTrue(math.isfinite(got))
+        self.assertLess(got, 0.0)  # a leaky estimate against a silent mixture scores far below zero
+
+
+if __name__ == "__main__":
+    unittest.main()

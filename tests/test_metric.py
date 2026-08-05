@@ -1,6 +1,10 @@
 import os
 import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# insert(0, ...) not append: with append, a pip-installed copy of this package in
+# site-packages shadows the working tree when this file is run directly
+# (python tests/test_x.py puts tests/ on sys.path[0], not the repo root), so the
+# suite would silently test the installed wheel instead of the code under edit.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import unittest
 import torch

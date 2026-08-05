@@ -7,7 +7,11 @@ def calculate_rms(samples: torch.Tensor):
         Args: samples (torch.Tensor): A tensor containing audio samples, with time samples in the last dimension.
         Returns: torch.Tensor: A tensor with the last dimension (time) reduced, containing the RMS power level of the audio samples.
     """
-    return torch.sqrt(torch.mean(torch.square(samples), dim=-1))
+    # clamp_min, not `+ eps`: at exactly zero `sqrt` has infinite derivative, so a
+    # grad-requiring all-silent input propagates NaN backwards while the forward value still
+    # looks finite. Clamping leaves every non-degenerate value bit-identical, whereas adding an
+    # epsilon would perturb very quiet inputs.
+    return torch.sqrt(torch.clamp_min(torch.mean(torch.square(samples), dim=-1), 1e-24))
 
 def convert_decibels_to_amplitude_ratio(decibels: Union[torch.Tensor, float]):
     """

@@ -105,8 +105,11 @@ class LogWMSE(torch.nn.Module):
             Tensor: The logWMSE between the processed audio and target audio.
         """
 
-        # Calculate the scaling factor based on the input RMS
-        scaling_factor = 1 / (input_rms + RMS_EPS)
+        # Calculate the scaling factor based on the input RMS. RMS_EPS is a FLOOR rather than an
+        # addend: clamping leaves the scaling factor exactly 1/input_rms for every non-degenerate
+        # input, so joint-gain scale invariance holds exactly, whereas adding RMS_EPS biases very
+        # quiet mixtures. Both forms give an identical value for a digitally silent mixture.
+        scaling_factor = 1 / torch.clamp_min(input_rms, RMS_EPS)
 
         # Add extra dimension(s) to scaling_factor to match the shape of processed_audio and target_audio
         while scaling_factor.dim() < processed_audio.dim():
