@@ -150,9 +150,13 @@ class HumanHearingSensitivityFilter:
         # Apply FFT convolution
         filtered_audio = fft_convolve(audio, self.impulse_response_fft, self.fft_size)
 
-        # Circularly shift signal to account for symmetric IR time delay
+        # Circularly shift the signal to undo the symmetric IR's group delay.
+        # The IR is centre-padded to fft_size, so its centre of symmetry lands at
+        #   left_padding + (M - 1) // 2   where   left_padding = (fft_size - M) // 2,
+        # which simplifies to fft_size // 2 - 1 for BOTH even and odd M. This matches the offset
+        # scipy.signal.oaconvolve(..., "same") uses upstream, so the two agree at any IR length.
         if self.symmetric_ir:
-            shift = (self.fft_size - (self.impulse_response.shape[-1] % 2)) // 2 - 1 # added case for odd length IR
+            shift = self.fft_size // 2 - 1
             filtered_audio = torch.roll(filtered_audio, -shift, dims=-1)
 
         return filtered_audio[..., :self.audio_length_samples]
