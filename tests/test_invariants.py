@@ -354,3 +354,58 @@ class TestDigitalSilence(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestImpulseResponseValidation(unittest.TestCase):
+    """A malformed impulse response must raise, not silently corrupt every result.
+
+    Upstream gets this guard for free: scipy.signal.oaconvolve raises
+    "in1 and in2 should have the same dimensionality" for a 2-D IR. The FFT-broadcast port lost it, so a
+    2-D IR was silently expanded against the STEM axis and an all-zero IR made the metric report its
+    ceiling for every input.
+    """
+
+    def _build(self, ir):
+        return HumanHearingSensitivityFilter(
+            audio_length=0.05, sample_rate=SR, impulse_response=ir, impulse_response_sample_rate=SR)
+
+    def test_multichannel_ir_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self._build(torch.rand(2, 4000))
+
+    def test_all_zero_ir_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self._build(torch.zeros(4000))
+
+    def test_non_finite_ir_is_rejected(self):
+        bad = torch.rand(4000)
+        bad[7] = float("nan")
+        with self.assertRaises(ValueError):
+            self._build(bad)
+        bad[7] = float("inf")
+        with self.assertRaises(ValueError):
+            self._build(bad)
+
+    def test_degenerate_length_is_rejected(self):
+        for ir in (torch.ones(1), torch.tensor(1.0)):
+            with self.subTest(shape=tuple(ir.shape)):
+                with self.assertRaises(ValueError):
+                    self._build(ir)
+
+    def test_singleton_dimensions_are_accepted(self):
+        # [1, N] and [N, 1] are ordinary ways to hold a mono FIR and must still work.
+        for ir in (torch.rand(1, 4000), torch.rand(4000, 1)):
+            with self.subTest(shape=tuple(ir.shape)):
+                f = self._build(ir)
+                self.assertEqual(f.impulse_response.ndim, 1)
+                self.assertEqual(f.impulse_response.numel(), 4000)
+
+    def test_valid_ir_still_works_end_to_end(self):
+        ir = torch.zeros(999)
+        ir[499] = 1.0
+        m = _metric(audio_length=0.05, impulse_response=ir, impulse_response_sample_rate=SR)
+        n = int(0.05 * SR)
+        torch.manual_seed(15)
+        u = (torch.rand(1, 1, n) * 2 - 1)
+        p = (torch.rand(1, 1, 1, n) * 2 - 1) * 0.1
+        self.assertTrue(math.isfinite(float(m(u, p, torch.zeros_like(p)))))

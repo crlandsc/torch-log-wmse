@@ -108,17 +108,40 @@ class HumanHearingSensitivityFilter:
             resampler = Resample(orig_freq=impulse_response_sample_rate, new_freq=sample_rate)
             impulse_response = resampler(impulse_response)
 
-        # Remove any singleton dimensions
-        self.impulse_response = impulse_response.squeeze()
+        # Remove any singleton dimensions, then validate. Without these checks a wrong-rank impulse
+        # response is silently broadcast against the stem axis instead of raising, and a degenerate one
+        # (all zeros, or containing NaN) corrupts every result: an all-zero IR makes the metric report
+        # its "perfect" ceiling for every input, forever.
+        impulse_response = torch.as_tensor(impulse_response, dtype=torch.float32).squeeze()
+        if impulse_response.ndim != 1:
+            raise ValueError(
+                "impulse_response must be one-dimensional after squeezing singleton dimensions, got "
+                f"shape {tuple(impulse_response.shape)}. Multi-channel FIRs are not supported."
+            )
+        if impulse_response.numel() < 2:
+            raise ValueError(
+                f"impulse_response must have at least 2 taps, got {impulse_response.numel()}."
+            )
+        if not torch.isfinite(impulse_response).all():
+            raise ValueError("impulse_response contains NaN or infinite values.")
+        if not torch.any(impulse_response != 0):
+            raise ValueError(
+                "impulse_response is all zeros, which would make every comparison report a perfect score."
+            )
+        self.impulse_response = impulse_response
 
         # Calculate minimum FFT size (N+M-1) - make a power of 2 for FFT efficiency
         self.audio_length_samples = math.floor(audio_length * sample_rate)
-        min_fft_size = self.audio_length_samples + impulse_response.shape[-1] - 1
+        min_fft_size = self.audio_length_samples + self.impulse_response.shape[-1] - 1
         self.fft_size = 2 ** math.ceil(math.log2(min_fft_size))
 
-        # Compute the FFT of the impulse response (will be padded to fft_size before FFT)
+        # Compute the FFT of the impulse response (will be padded to fft_size before FFT).
+        # Note this uses the squeezed, validated IR - passing the raw argument here would reintroduce
+        # the rank mismatch the validation above exists to prevent.
         self.symmetric_ir = symmetric_ir
-        self.impulse_response_fft = prepare_impulse_response_fft(impulse_response, self.fft_size, symmetric_ir=self.symmetric_ir)
+        self.impulse_response_fft = prepare_impulse_response_fft(
+            self.impulse_response, self.fft_size, symmetric_ir=self.symmetric_ir
+        )
 
 
     def __call__(self, audio: Tensor) -> Tensor:
