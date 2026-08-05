@@ -81,7 +81,13 @@ jobs:
           overlap = main & alias
           if overlap:
               sys.exit(f"FAIL: both distributions claim {sorted(overlap)}")
-          print("OK: alias is metadata-only, no file overlap")
+          # A stale build/ directory can reintroduce the pickle the project deliberately removed.
+          bad = [n for n in main if n.endswith((".pkl", ".pickle", ".pt", ".pth"))]
+          if bad:
+              sys.exit(f"FAIL: wheel ships a deserialisation-format resource: {bad}")
+          if "torch_log_wmse/filter_ir.f32" not in main:
+              sys.exit("FAIL: wheel is missing torch_log_wmse/filter_ir.f32")
+          print("OK: alias is metadata-only, no file overlap, no pickled resources")
           PY
 
       - name: twine check
@@ -98,7 +104,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: production
-      url: https://pypi.org/p/torch-log-wmse
+      url: ${{ inputs.target == 'pypi' && 'https://pypi.org/p/torch-log-wmse' || 'https://test.pypi.org/p/torch-log-wmse' }}
     permissions:
       id-token: write # trusted publishing; no long-lived API token on a command line
     steps:

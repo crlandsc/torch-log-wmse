@@ -22,6 +22,7 @@ audit. Treat a mismatch at that scale as expected; anything larger means somethi
 """
 import hashlib
 import os
+import sys
 from pathlib import Path
 from typing import Callable
 
@@ -119,10 +120,33 @@ if __name__ == "__main__":
     )
     here = Path(os.path.abspath(os.path.dirname(__file__)))
     package_dir = here.parent / "torch_log_wmse"
+    shipped = package_dir / "filter_ir.f32"
     payload = np.asarray(ir, dtype="<f4").tobytes()
-    out = package_dir / "filter_ir.f32"
-    out.write_bytes(payload)
     digest = hashlib.sha256(payload).hexdigest()
+
+    # Write beside the script, NOT over the shipped resource. Overwriting it would invalidate the
+    # SHA-256 pinned in freq_weighting_filter.py, so every later LogWMSE(...) would raise an
+    # integrity error -- and it would destroy the very bytes you regenerated in order to compare.
+    out = here / "filter_ir.regenerated.f32"
+    out.write_bytes(payload)
     print(f"wrote {out} ({len(payload)} bytes, {len(payload) // 4} float32 taps)")
-    print(f"sha256 = {digest}")
-    print("paste that into _IR_SHA256 in torch_log_wmse/freq_weighting_filter.py")
+    print(f"regenerated sha256 = {digest}")
+
+    if shipped.exists():
+        current = shipped.read_bytes()
+        print(f"shipped      sha256 = {hashlib.sha256(current).hexdigest()}")
+        if len(current) == len(payload):
+            a = np.frombuffer(current, dtype="<f4")
+            b = np.frombuffer(payload, dtype="<f4")
+            print(f"max|regenerated - shipped| = {np.abs(a - b).max():.3e}  "
+                  f"(expect ~1.6e-08; see the module docstring)")
+        else:
+            print(f"length differs: shipped {len(current)} bytes vs regenerated {len(payload)}")
+
+    if "--overwrite" in sys.argv:
+        shipped.write_bytes(payload)
+        print(f"\nOVERWROTE {shipped}")
+        print(f"Now update _IR_SHA256 in torch_log_wmse/freq_weighting_filter.py to:\n  {digest}")
+    else:
+        print("\nThe shipped resource was NOT modified. Pass --overwrite to replace it, and then "
+              "update _IR_SHA256 in torch_log_wmse/freq_weighting_filter.py to the regenerated digest.")

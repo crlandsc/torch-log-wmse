@@ -143,6 +143,15 @@ class HumanHearingSensitivityFilter:
             impulse_response: Optional[torch.Tensor] = None,
             impulse_response_sample_rate: int = 44100,
         ):
+        # Validate the rates first: Resample() below would otherwise fail with a less useful error,
+        # and math.log2 further down raises a bare "math domain error" for a non-positive length.
+        if sample_rate <= 0:
+            raise ValueError(f"sample_rate must be positive, got {sample_rate}")
+        if impulse_response_sample_rate <= 0:
+            raise ValueError(
+                f"impulse_response_sample_rate must be positive, got {impulse_response_sample_rate}"
+            )
+
         # Load the impulse response if not provided
         if impulse_response is None:
             impulse_response = load_bundled_impulse_response()
@@ -176,6 +185,12 @@ class HumanHearingSensitivityFilter:
 
         # Calculate minimum FFT size (N+M-1) - make a power of 2 for FFT efficiency
         self.audio_length_samples = math.floor(audio_length * sample_rate)
+        if self.audio_length_samples < 1:
+            raise ValueError(
+                f"audio_length * sample_rate must be at least 1 sample, got {audio_length} x "
+                f"{sample_rate} = {audio_length * sample_rate}. A negative or near-zero audio_length "
+                "otherwise fails later with an opaque math domain error."
+            )
         min_fft_size = self.audio_length_samples + self.impulse_response.shape[-1] - 1
         self.fft_size = 2 ** math.ceil(math.log2(min_fft_size))
 

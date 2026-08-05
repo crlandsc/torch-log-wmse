@@ -15,11 +15,16 @@ def calculate_rms(samples: torch.Tensor):
         Args: samples (torch.Tensor): A tensor containing audio samples, with time samples in the last dimension.
         Returns: torch.Tensor: A tensor with the last dimension (time) reduced, containing the RMS power level of the audio samples.
     """
-    # clamp_min, not `+ eps`: at exactly zero `sqrt` has infinite derivative, so a
-    # grad-requiring all-silent input propagates NaN backwards while the forward value still
-    # looks finite. Clamping leaves every non-degenerate value bit-identical, whereas adding an
-    # epsilon would perturb very quiet inputs.
-    return torch.sqrt(torch.clamp_min(torch.mean(torch.square(samples), dim=-1), 1e-24))
+    # clamp_min, not `+ eps`: at exactly zero `sqrt` has infinite derivative, so a grad-requiring
+    # all-silent input propagates NaN backwards while the forward value still looks finite.
+    #
+    # The floor is the dtype's smallest normal rather than a hard-coded constant. A literal like
+    # 1e-24 underflows to 0.0 in float16, making the guard a silent no-op there, and it would also
+    # rewrite any legitimate mean-square below it -- float32 represents mean-squares down to ~1e-38,
+    # so a fixed 1e-24 would alter about seven decades of genuinely quiet audio. finfo().tiny clamps
+    # only subnormals, so every normal value is untouched in every dtype.
+    mean_square = torch.mean(torch.square(samples), dim=-1)
+    return torch.sqrt(torch.clamp_min(mean_square, torch.finfo(mean_square.dtype).tiny))
 
 def convert_decibels_to_amplitude_ratio(decibels: Union[torch.Tensor, float]):
     """

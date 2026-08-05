@@ -441,9 +441,12 @@ class TestSilenceGradients(unittest.TestCase):
         """A silent mixture must scale by exactly 1/RMS_EPS, and the resulting value is pinned.
 
         This is a value assertion rather than a NaN check on purpose. The original 0.2.8 bug was
-        1/0 -> inf -> 0*inf -> NaN, but the clamp inside calculate_rms now prevents an exactly-zero
-        RMS independently, so removing the RMS_EPS floor no longer produces NaN -- it produces a
-        WRONG NUMBER (measured -220.55 instead of -71.93). Only pinning the value catches that.
+        1/0 -> inf -> 0*inf -> NaN, but the subnormal floor inside calculate_rms now prevents an
+        exactly-zero RMS independently, so removing the RMS_EPS floor no longer produces NaN -- it
+        produces a wrong number instead, tens of units below the correct one. Only pinning the value
+        catches that. (The exact mutant value depends on calculate_rms's floor, so it is deliberately
+        not quoted here; two fixes guard this failure by different mechanisms and each needs its own
+        test, which is what the mutation study established.)
         """
         n = 4096
         m = _metric(audio_length=n / SR, reduction="none")
@@ -519,9 +522,15 @@ class TestBundledImpulseResponse(unittest.TestCase):
 
     It used to ship as a pickle, which `pickle.load` deserialises by resolving and calling arbitrary
     dotted global names, with no validation of the result. It is now raw float32 with a pinned length
-    and digest. These tests also serve as the provenance check: rather than trusting an opaque blob,
-    they assert the filter's measured frequency response against the corners it was designed to have
-    (120 Hz high-pass, 500 Hz +2.5 dB peak, 1500 Hz +5 dB shelf, 10 kHz low-pass).
+    and digest.
+
+    Note on what the response test below does and does not prove. Its expected values are
+    measurements of this same artifact, so it is a CORRUPTION AND REGRESSION GUARD, not a provenance
+    check -- it cannot distinguish "this is the designed filter" from "this is whatever blob was
+    committed". Actual provenance is dev/create_freq_weighting_filter_ir.py, which regenerates the
+    response from the documented audiomentations recipe and agrees to ~1.6e-08. The individual
+    design parameters are also not directly readable off the response: the 1500 Hz shelf is +5 dB in
+    isolation but measures +2.64 dB in the assembled cascade.
     """
 
     def test_loads_with_expected_shape_and_dtype(self):
@@ -580,8 +589,12 @@ class TestBundledImpulseResponse(unittest.TestCase):
         self.assertLess(float((h[1999 + k] - h[1999 - k]).abs().max()), 1e-7)
         self.assertEqual(int(h.abs().argmax()), 1999)
 
-    def test_frequency_response_matches_the_designed_curve(self):
-        """Provenance check: the response corners must match the documented filter design."""
+    def test_frequency_response_is_unchanged(self):
+        """Corruption guard: the measured response must match the values recorded for this artifact.
+
+        Not a provenance check -- see the class docstring. These numbers were measured from this
+        blob, so they detect a swapped, truncated or resampled filter, not a wrong design.
+        """
         from torch_log_wmse.freq_weighting_filter import load_bundled_impulse_response
         h = load_bundled_impulse_response()
         n = 1 << 16
@@ -591,9 +604,11 @@ class TestBundledImpulseResponse(unittest.TestCase):
         def at(hz):
             return float(mag[int(torch.argmin((freqs - hz).abs()))])
 
-        # Designed: 120 Hz high-pass, 500 Hz +2.5 dB peak, 1500 Hz +5 dB shelf, 10 kHz low-pass.
-        for hz, expected in ((20, -30.97), (50, -15.39), (120, -2.89), (500, 2.53),
-                             (1000, 1.49), (3000, 4.24), (10000, -1.02), (20000, -30.94)):
+        # Measured from this artifact. The shape is consistent with the documented design (120 Hz
+        # high-pass, 500 Hz peak, 1500 Hz shelf, 10 kHz low-pass) but these are cascade outputs, not
+        # the individual filter parameters.
+        for hz, expected in ((20, -30.97), (50, -15.39), (120, -2.89), (500, 2.53), (1000, 1.49),
+                             (1500, 2.64), (3000, 4.24), (10000, -1.02), (20000, -30.94)):
             with self.subTest(hz=hz):
                 self.assertAlmostEqual(at(hz), expected, delta=0.15)
         # -3 dB corners bracket the passband.
@@ -628,6 +643,71 @@ class TestApplyReductionDirectly(unittest.TestCase):
     def test_valid_reductions_constant_is_exported(self):
         from torch_log_wmse.utils import VALID_REDUCTIONS
         self.assertEqual(set(VALID_REDUCTIONS), {"none", "mean", "sum"})
+
+
+class TestConstructorValidation(unittest.TestCase):
+    """audio_length and sample_rate must be validated, not left to fail opaquely later."""
+
+    def test_degenerate_audio_length_raises(self):
+        for bad in (0, -1.0, 1e-9):
+            with self.subTest(audio_length=bad):
+                with self.assertRaisesRegex(ValueError, "at least 1 sample"):
+                    _metric(audio_length=bad)
+
+    def test_non_positive_sample_rate_raises(self):
+        for bad in (0, -44100):
+            with self.subTest(sample_rate=bad):
+                with self.assertRaisesRegex(ValueError, "sample_rate must be positive"):
+                    _metric(audio_length=1.0, sample_rate=bad)
+
+    def test_non_positive_impulse_response_sample_rate_raises(self):
+        with self.assertRaisesRegex(ValueError, "impulse_response_sample_rate must be positive"):
+            _metric(audio_length=1.0, impulse_response_sample_rate=0)
+
+    def test_fractional_audio_length_accepts_floor_or_round(self):
+        # floor() and round() of audio_length * sample_rate differ by one sample for many fractional
+        # lengths (22 of the 399 hundredth-second values at 44.1 kHz). Rejecting the round() form
+        # would fail callers who sized their segments the ordinary way.
+        for length in (0.35, 0.57, 0.69, 0.7):
+            with self.subTest(audio_length=length):
+                m = _metric(audio_length=length)
+                for n in (math.floor(length * SR), round(length * SR)):
+                    out = m(torch.rand(1, 1, n), torch.rand(1, 1, 1, n), torch.zeros(1, 1, 1, n))
+                    self.assertTrue(math.isfinite(float(out)))
+
+    def test_length_still_rejects_a_real_mismatch(self):
+        m = _metric(audio_length=1.0)
+        for n in (SR // 2, SR * 2, SR + 100):
+            with self.subTest(n=n):
+                with self.assertRaisesRegex(ValueError, "expected"):
+                    m(torch.rand(1, 1, n), torch.rand(1, 1, 1, n), torch.zeros(1, 1, 1, n))
+
+
+class TestRmsFloorIsDtypeCorrect(unittest.TestCase):
+    """The sqrt floor must be the dtype's smallest normal, not a hard-coded constant.
+
+    A literal such as 1e-24 underflows to 0.0 in float16, making the guard a silent no-op there, and
+    it would also rewrite any legitimate mean-square below it -- float32 represents mean-squares down
+    to about 1e-38, so a fixed 1e-24 altered roughly seven decades of genuinely quiet audio.
+    """
+
+    def test_gradient_at_zero_is_finite_in_every_float_dtype(self):
+        from torch_log_wmse.utils import calculate_rms
+        for dtype in (torch.float32, torch.float64, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                z = torch.zeros(1, 1, 1, 16, dtype=dtype, requires_grad=True)
+                calculate_rms(z).sum().backward()
+                self.assertTrue(torch.isfinite(z.grad).all())
+                self.assertEqual(float(z.grad.abs().max()), 0.0)
+
+    def test_quiet_but_normal_amplitudes_are_preserved(self):
+        from torch_log_wmse.utils import calculate_rms
+        # 1e-13 is about -260 dBFS: absurdly quiet, but its mean-square is still a normal float32,
+        # so it must pass through untouched. The old 1e-24 floor clamped it to 1e-12.
+        for amp in (1e-6, 1e-10, 1e-13):
+            with self.subTest(amp=amp):
+                got = float(calculate_rms(torch.full((1, 1, 1, 64), amp)))
+                self.assertAlmostEqual(got / amp, 1.0, places=3)
 
 
 if __name__ == "__main__":

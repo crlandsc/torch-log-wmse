@@ -105,12 +105,16 @@ class LogWMSE(torch.nn.Module):
         # The filter truncates to the length configured at construction, so a mismatch would silently
         # score a different window than the caller passed - and bypass_filter=True would not truncate
         # at all, making the two paths disagree on which samples they scored.
+        # audio_length * sample_rate is rarely an exact integer, and floor() vs round() differ by one
+        # sample for many fractional lengths (22 of the 399 hundredth-second values at 44.1 kHz). A
+        # caller who sized their segment with round() is not making a mistake, so accept either.
         expected = self.filters.audio_length_samples
-        if unprocessed_audio.shape[-1] != expected:
+        if unprocessed_audio.shape[-1] not in (expected, expected + 1):
             raise ValueError(
-                f"expected {expected} samples (audio_length x sample_rate as configured), got "
-                f"{unprocessed_audio.shape[-1]}. Construct a LogWMSE for this length, or trim/pad the "
-                "input to match."
+                f"expected {expected} samples for the configured audio_length "
+                f"(floor(audio_length * sample_rate); {expected + 1} is also accepted for callers who "
+                f"round up), got {unprocessed_audio.shape[-1]}. Construct a LogWMSE for this length, "
+                "or trim/pad the input to match."
             )
 
         if self.bypass_filter:
@@ -175,9 +179,10 @@ class LogWMSE(torch.nn.Module):
         if not bypass_filter:
             differences = filters(differences)
 
-        # Discard differences too small to be audible. torch.where is used rather than an in-place
-        # masked assignment: it avoids a data-dependent scatter and does not materialise a full-size
-        # boolean index, which keeps the graph friendly to torch.compile.
+        # Discard differences too small to be audible. torch.where rather than an in-place masked
+        # assignment: it avoids a data-dependent scatter, which keeps the graph friendly to
+        # torch.compile. Note it does NOT save memory - both forms build the full-size boolean
+        # condition, and where() additionally allocates a new output buffer.
         differences = torch.where(
             torch.abs(differences) < ERROR_TOLERANCE_THRESHOLD,
             torch.zeros((), dtype=differences.dtype, device=differences.device),

@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # Required so the publish workflow can call this as a reusable workflow for its test gate.
+  # Without it GitHub rejects pypi.yml as invalid and no release job runs at all.
+  workflow_call:
 
 jobs:
   tests:
@@ -13,16 +16,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Mirrors upstream's matrix: one numpy 1.x leg and one numpy 2.x leg, because the bundled
-        # filter_ir.pkl unpickles through numpy.core.multiarray._reconstruct and numpy 2 renamed
-        # numpy.core to numpy._core. The compat shim is what keeps that working, so both legs matter.
+        # The package itself no longer depends on numpy at all (the bundled filter is raw float32,
+        # not a pickle), so this is a plain Python-version matrix spanning python_requires >=3.9.
+        # numpy still arrives transitively via the optional parity dependency; the legs below pin it
+        # on one job each so both major versions get exercised by that path.
         include:
-          - python: "3.10"
-            numpy: "numpy>=1.23.5,<2"
+          - python: "3.9"
+            numpy: "numpy>=1.22,<2"
           - python: "3.11"
             numpy: "numpy>=2,<3"
           - python: "3.12"
-            numpy: "numpy>=2,<3"
+            numpy: ""
 
     steps:
       - uses: actions/checkout@v4
@@ -38,16 +42,29 @@ jobs:
           python -m pip install --upgrade pip wheel
           # CPU-only torch keeps the runner fast and avoids pulling CUDA wheels.
           pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
-          pip install "$NUMPY_SPEC"
+          if [ -n "$NUMPY_SPEC" ]; then pip install "$NUMPY_SPEC"; fi
           pip install pytest
           # Optional reference implementation, so the upstream-parity tests actually run rather
           # than skipping. It pulls scipy and soxr.
           pip install log-wmse-audio-quality
 
-      - name: Show resolved versions
+      - name: Show resolved versions and assert the numpy pin held
+        env:
+          NUMPY_SPEC: ${{ matrix.numpy }}
         run: |
-          python -c "import sys, torch, torchaudio, numpy; print('python', sys.version)"
-          python -c "import torch, torchaudio, numpy; print('torch', torch.__version__, '| torchaudio', torchaudio.__version__, '| numpy', numpy.__version__)"
+          python -c "import sys; print('python', sys.version)"
+          python -c "import torch, torchaudio; print('torch', torch.__version__, '| torchaudio', torchaudio.__version__)"
+          python - <<'EOF'
+          import os, sys
+          spec = os.environ.get("NUMPY_SPEC", "")
+          import numpy
+          print("numpy", numpy.__version__)
+          if spec:
+              want = 1 if "<2" in spec else 2
+              got = int(numpy.__version__.split(".")[0])
+              if got != want:
+                  sys.exit(f"numpy pin did not hold: wanted major {want}, resolved {numpy.__version__}")
+          EOF
 
       - name: Run tests
         run: pytest -q
