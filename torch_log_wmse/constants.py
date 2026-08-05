@@ -1,3 +1,11 @@
+"""Constants for the logWMSE metric.
+
+Derived from nomonosound/log-wmse-audio-quality (Copyright 2023 Nomono), licensed under the
+Apache License 2.0. Modified by Whitebalance LLC in 2024-2026: ported from numpy to PyTorch,
+FFT convolution in place of scipy.signal.oaconvolve, batched [batch, channel, stem, time] tensor
+API, differentiable loss support, and the impulse-response/silence handling described in the
+README and CHANGELOG.
+"""
 from torch_log_wmse.utils import convert_decibels_to_amplitude_ratio
 
 # Error tolerance threshold, relative to 0 dB RMS
