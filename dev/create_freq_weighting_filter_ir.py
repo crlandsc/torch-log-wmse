@@ -1,7 +1,7 @@
 """Regenerate the bundled hearing-sensitivity impulse response.
 
 VENDORED, WITH MODIFICATIONS, from nomonosound/log-wmse-audio-quality
-(Copyright 2023 Nomono, Apache License 2.0). Modified by Whitebalance LLC: writes
+(Copyright 2023 Nomono, Apache License 2.0). Modified by Christopher Landschoot (SoundFoxLabs): writes
 torch_log_wmse/filter_ir.f32 as raw little-endian float32 instead of a pickle, and prints the
 SHA-256 to paste into freq_weighting_filter.py.
 

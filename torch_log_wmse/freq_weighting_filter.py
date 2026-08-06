@@ -1,7 +1,7 @@
 """Human hearing sensitivity weighting filter.
 
 Derived from nomonosound/log-wmse-audio-quality (Copyright 2023 Nomono), licensed under the
-Apache License 2.0. Modified by Whitebalance LLC in 2024-2026: ported from numpy to PyTorch,
+Apache License 2.0. Modified by Christopher Landschoot (SoundFoxLabs) in 2024-2026: ported from numpy to PyTorch,
 FFT convolution in place of scipy.signal.oaconvolve, batched [batch, channel, stem, time] tensor
 API, differentiable loss support, and the impulse-response/silence handling described in the
 README and CHANGELOG.

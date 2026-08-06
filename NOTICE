@@ -1,0 +1,29 @@
+torch-log-wmse
+Copyright 2024-2026 Christopher Landschoot
+Copyright 2026 SoundFoxLabs
+
+This product includes software originally developed by Nomono:
+
+    log-wmse-audio-quality
+    https://github.com/nomonosound/log-wmse-audio-quality
+    Copyright 2023 Nomono
+    Licensed under the Apache License, Version 2.0
+
+This project is a PyTorch port of that work and is licensed under the same terms. See LICENSE.
+
+Portions derived from the original work, and the modifications made to them:
+
+  * torch_log_wmse/{metric,freq_weighting_filter,utils,constants}.py - ported from numpy to PyTorch;
+    FFT convolution in place of scipy.signal.oaconvolve; batched [batch, channel, stem, time] tensor
+    API; differentiable loss support; changes to aggregation, impulse-response handling, and silence
+    handling as described in README.md and CHANGELOG.md.
+
+  * torch_log_wmse/filter_ir.f32 - the bundled hearing-sensitivity impulse response, derived from the
+    filter design in the original work and stored as raw little-endian float32 rather than a pickle.
+
+  * dev/create_freq_weighting_filter_ir.py - vendored from the original work with modifications, so
+    that the bundled impulse response can be regenerated and verified rather than trusted as an
+    opaque binary.
+
+Where this port's numerical results deliberately differ from the original, the differences are
+documented in README.md and CHANGELOG.md.

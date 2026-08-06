@@ -1,6 +1,7 @@
 # The sdist is the auditable form of this package, so it carries what is needed to verify and
 # regenerate what the wheel ships -- not only the importable code.
 include LICENSE
+include NOTICE
 include README.md
 include CHANGELOG.md
 include requirements.txt
