@@ -192,4 +192,17 @@ class LogWMSE(torch.nn.Module):
         # Calculate the mean squared differences
         mean_diff = (differences**2).mean(dim=-1)
 
+        # Take the log in at least float32, whatever the input dtype was. EPS = 1e-8 underflows to
+        # exactly 0.0 in float16 (the smallest subnormal is 5.96e-8), so a bit-exact stem used to
+        # give log(0) = -inf and the metric returned +inf - and "mean" then propagated that inf
+        # across the whole batch. bfloat16 does not underflow but carries 8 mantissa bits, which is
+        # not enough to hold mse + EPS apart from mse.
+        #
+        # Upcasting rather than using a per-dtype floor is a deliberate choice: it keeps the ceiling
+        # at SCALER*log(EPS) = +73.6827 in EVERY dtype. A floor of finfo(float16).tiny would move
+        # the fp16 ceiling to +38.8 and silently make fp16 and float32 runs incomparable, which is
+        # a worse failure than the one being fixed because it looks like a valid number.
+        if mean_diff.dtype not in (torch.float32, torch.float64):
+            mean_diff = mean_diff.to(torch.float32)
+
         return torch.log(mean_diff + EPS) * SCALER

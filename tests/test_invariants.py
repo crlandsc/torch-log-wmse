@@ -705,5 +705,73 @@ class TestRmsFloorIsDtypeCorrect(unittest.TestCase):
                 self.assertAlmostEqual(got / amp, 1.0, places=3)
 
 
+class TestLowPrecisionDtypes(unittest.TestCase):
+    """float16 and bfloat16 must return a finite number, and the SAME ceiling as float32.
+
+    The bug: EPS = 1e-8 underflows to exactly 0.0 in float16 (smallest subnormal 5.96e-8), so a
+    bit-exact stem gave log(0) = -inf and the metric returned +inf - which "mean" then spread across
+    the entire batch. bfloat16 does not underflow but has 8 mantissa bits, too few to keep mse + EPS
+    distinct from mse.
+
+    COVERAGE LIMIT, stated so nobody assumes otherwise: every test here runs with
+    bypass_filter=True, because torch.fft has no half kernel on CPU or on MPS ("Unsupported dtype
+    Half" on both). Half precision through the FILTERING path is unreachable on any hardware this
+    project can test on, and whether CUDA provides a half FFT kernel is untested - there is no CUDA
+    device available.
+    """
+
+    HALF_DTYPES = (torch.float16, torch.bfloat16)
+
+    def _triplet(self, dtype, n=1024, exact_stem=True):
+        torch.manual_seed(5)
+        u = (torch.rand(1, 1, n) * 2 - 1).to(dtype)
+        t = (torch.rand(1, 1, 2, n) * 2 - 1).to(dtype)
+        p = t.clone()
+        if not exact_stem:
+            p = p + 0.1
+        else:
+            p[:, :, 1] = p[:, :, 1] + 0.1  # stem 0 exact, stem 1 not
+        return u, p, t
+
+    def test_bit_exact_stem_is_finite_and_hits_the_float32_ceiling(self):
+        for dtype in self.HALF_DTYPES:
+            with self.subTest(dtype=dtype):
+                m = _metric(audio_length=1024 / SR, bypass_filter=True, reduction="none")
+                u, p, t = self._triplet(dtype)
+                got = m(u, p, t)
+                self.assertTrue(torch.isfinite(got).all(), f"{dtype} produced {got}")
+                # Stem 0 is bit-exact, so it must read the ceiling - the SAME ceiling float32 gives.
+                self.assertAlmostEqual(float(got[0, 0, 0]), CEILING, places=3)
+
+    def test_mean_reduction_does_not_propagate_an_infinity(self):
+        """The failure that made this worth fixing: one exact stem used to poison the whole batch."""
+        for dtype in self.HALF_DTYPES:
+            with self.subTest(dtype=dtype):
+                m = _metric(audio_length=1024 / SR, bypass_filter=True)
+                got = m(*self._triplet(dtype))
+                self.assertTrue(torch.isfinite(got).all(), f"{dtype} produced {got}")
+
+    def test_agrees_with_float32_on_a_non_degenerate_case(self):
+        """Half precision may be coarse, but it must not be WRONG."""
+        m = _metric(audio_length=1024 / SR, bypass_filter=True)
+        ref = float(m(*self._triplet(torch.float32, exact_stem=False)))
+        for dtype in self.HALF_DTYPES:
+            with self.subTest(dtype=dtype):
+                got = float(m(*self._triplet(dtype, exact_stem=False)))
+                self.assertAlmostEqual(got, ref, delta=0.5,
+                                       msg=f"{dtype} read {got} vs float32 {ref}")
+
+    def test_backward_is_finite_through_a_bit_exact_stem(self):
+        """Forward-only checks miss this class entirely: the value can be finite while the gradient
+        is not. Kept here because the same trap reappears when pooling gains a fractional power."""
+        for dtype in self.HALF_DTYPES:
+            with self.subTest(dtype=dtype):
+                m = _metric(audio_length=1024 / SR, bypass_filter=True)
+                u, p, t = self._triplet(dtype)
+                p = p.detach().requires_grad_(True)
+                m(u, p, t).backward()
+                self.assertTrue(torch.isfinite(p.grad).all(), f"{dtype} grad: {p.grad}")
+
+
 if __name__ == "__main__":
     unittest.main()
