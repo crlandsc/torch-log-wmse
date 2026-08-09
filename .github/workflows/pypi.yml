@@ -15,7 +15,7 @@ jobs:
     uses: ./.github/workflows/ci.yml
 
   build:
-    name: Build both distributions
+    name: Build the distribution
     needs: test
     runs-on: ubuntu-latest
     steps:
@@ -38,60 +38,38 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Building version $VERSION"
 
-      # The real distribution: ships torch_log_wmse AND the torch_log_wmse_audio_quality shim, so both
-      # import names work from a single install. Each build writes to its own outdir, so no upload can
-      # ever re-send the other distribution's artifacts.
+      # One distribution as of 1.0.0. The torch_log_wmse_audio_quality shim and the metadata-only
+      # alias distribution are both gone: a shim that forwards a CHANGED API is worse than none,
+      # because old code imports cleanly and then behaves differently.
       - name: Build torch-log-wmse
         run: |
           rm -rf dist build
           python -m build --outdir dist/main
 
-      # The legacy name: metadata only, depending on the real distribution. Shipping no files is what
-      # stops the two distributions owning the same paths. See packaging/alias/README.md.
-      - name: Build torch-log-wmse-audio-quality
-        env:
-          VERSION: ${{ steps.ver.outputs.version }}
-        run: |
-          python - <<'PY'
-          import os, pathlib, re
-          v = os.environ["VERSION"]
-          p = pathlib.Path("packaging/alias/pyproject.toml")
-          s = p.read_text()
-          s = re.sub(r'^version = ".*"$', f'version = "{v}"', s, count=1, flags=re.M)
-          s = re.sub(r'^dependencies = \["torch-log-wmse"\]$',
-                     f'dependencies = ["torch-log-wmse=={v}"]', s, count=1, flags=re.M)
-          p.write_text(s)
-          print(f"pinned alias to torch-log-wmse=={v}")
-          PY
-          cd packaging/alias && python -m build --outdir ../../dist/alias
-
-      - name: Verify the two distributions do not overlap
+      - name: Verify the wheel ships what it must and nothing it must not
         run: |
           python - <<'PY'
           import glob, zipfile, sys
-          def payload(whl):
-              with zipfile.ZipFile(whl) as z:
-                  return {n for n in z.namelist() if ".dist-info/" not in n}
-          main = payload(glob.glob("dist/main/*.whl")[0])
-          alias = payload(glob.glob("dist/alias/*.whl")[0])
-          print("main  payload files:", len(main))
-          print("alias payload files:", len(alias), sorted(alias))
-          if alias:
-              sys.exit(f"FAIL: the alias distribution must ship no code, got {sorted(alias)}")
-          overlap = main & alias
-          if overlap:
-              sys.exit(f"FAIL: both distributions claim {sorted(overlap)}")
+          with zipfile.ZipFile(glob.glob("dist/main/*.whl")[0]) as z:
+              payload = {n for n in z.namelist() if ".dist-info/" not in n}
+          print("payload files:", len(payload))
           # A stale build/ directory can reintroduce the pickle the project deliberately removed.
-          bad = [n for n in main if n.endswith((".pkl", ".pickle", ".pt", ".pth"))]
+          bad = [n for n in payload if n.endswith((".pkl", ".pickle", ".pt", ".pth"))]
           if bad:
               sys.exit(f"FAIL: wheel ships a deserialisation-format resource: {bad}")
-          if "torch_log_wmse/filter_ir.f32" not in main:
-              sys.exit("FAIL: wheel is missing torch_log_wmse/filter_ir.f32")
-          print("OK: alias is metadata-only, no file overlap, no pickled resources")
+          for required in ("torch_log_wmse/filter_ir.f32", "torch_log_wmse/py.typed"):
+              if required not in payload:
+                  sys.exit(f"FAIL: wheel is missing {required}")
+          # The classic silent failure is a py.typed that exists in the tree but was never packaged,
+          # so the hints stay invisible to type checkers and nothing complains.
+          leftover = sorted(n for n in payload if n.startswith("torch_log_wmse_audio_quality/"))
+          if leftover:
+              sys.exit(f"FAIL: the removed shim is still being packaged: {leftover}")
+          print("OK: filter_ir.f32 and py.typed present, no pickled resources, no legacy shim")
           PY
 
       - name: twine check
-        run: python -m twine check dist/main/* dist/alias/*
+        run: python -m twine check dist/main/*
 
       - uses: actions/upload-artifact@v4
         with:
@@ -113,16 +91,10 @@ jobs:
           name: dist
           path: dist/
 
-      # Trusted publishing (OIDC) rather than `-p ${{ secrets.* }}`. Each distribution uploads from
-      # its own directory, so one upload cannot re-send the other's files.
+      # Trusted publishing (OIDC) rather than `-p ${{ secrets.* }}`, so no long-lived API token
+      # ever appears on a command line.
       - name: Publish torch-log-wmse
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/main/
-          repository-url: ${{ inputs.target == 'pypi' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
-
-      - name: Publish torch-log-wmse-audio-quality
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist/alias/
           repository-url: ${{ inputs.target == 'pypi' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}

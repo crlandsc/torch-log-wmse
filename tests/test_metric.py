@@ -17,11 +17,6 @@ import torch
 from tests.conftest import CEILING, make_filter, make_loss, make_metric
 from torch_log_wmse.utils import calculate_rms, convert_decibels_to_amplitude_ratio
 
-# Test alias package
-# from torch_log_wmse_audio_quality import LogWMSE
-# from torch_log_wmse_audio_quality.utils import calculate_rms, convert_decibels_to_amplitude_ratio
-# from torch_log_wmse_audio_quality.freq_weighting_filter import prepare_impulse_response_fft, HumanHearingSensitivityFilter
-
 class TestLogWMSELoss(unittest.TestCase):
     def setUp(self):
         pass # Anything shared between tests

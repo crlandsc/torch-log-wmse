@@ -16,7 +16,6 @@ include dev/create_freq_weighting_filter_ir.py
 # *.json as well as *.py: tests/goldens.json is the recorded baseline the characterization tests
 # assert against, so a tests-without-goldens sdist ships a suite that cannot run.
 recursive-include tests *.py *.json
-graft packaging
 
 # Never ship audit scratch, caches, or build leftovers.
 prune .audit
