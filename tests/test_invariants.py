@@ -8,7 +8,7 @@ Design notes:
 * No matplotlib import, so this module runs without a plotting stack.
 * Oracles are closed-form wherever possible rather than golden values recorded from this implementation,
   so they stay valid across torch versions and FFT round-off changes.
-* Threads are capped so the suite stays polite on a shared machine.
+* Construction goes through tests/conftest.py, which also caps threads and owns the sys.path order.
 """
 import math
 import os
@@ -24,19 +24,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import unittest
 
-from torch_log_wmse import LogWMSE
+# conftest owns the sys.path insertion, the thread cap, SR/CEILING, and every construction of the
+# metric and the filter. Constructing through it is what keeps the 1.0.0 constructor changes to one
+# edit rather than forty.
+from tests.conftest import CEILING, SR, make_filter, make_metric
 from torch_log_wmse.constants import EPS, ERROR_TOLERANCE_THRESHOLD, SCALER
-from torch_log_wmse.freq_weighting_filter import HumanHearingSensitivityFilter
 
-torch.set_num_threads(2)
-
-SR = 44100
-CEILING = float(SCALER * math.log(EPS))  # +73.6827..., the value for an exact match
-
-
-def _metric(audio_length=1.0, sample_rate=SR, **kw):
-    kw.setdefault("return_as_loss", False)
-    return LogWMSE(audio_length=audio_length, sample_rate=sample_rate, **kw)
+# Module-local alias, so the call sites below stay as they are.
+_metric = make_metric
 
 
 class TestClosedFormOracle(unittest.TestCase):
@@ -100,7 +95,7 @@ class TestFilterIsZeroPhase(unittest.TestCase):
     def _roundtrip_offset(self, ir_len, n=512):
         ir = torch.zeros(ir_len)
         ir[(ir_len - 1) // 2] = 1.0
-        f = HumanHearingSensitivityFilter(
+        f = make_filter(
             audio_length=n / SR, sample_rate=SR,
             impulse_response=ir, impulse_response_sample_rate=SR)
         x = torch.zeros(1, 1, 1, n)
@@ -117,7 +112,7 @@ class TestFilterIsZeroPhase(unittest.TestCase):
                 self.assertLess(err, 1e-5)
 
     def test_builtin_filter_preserves_length_and_is_finite(self):
-        f = HumanHearingSensitivityFilter(audio_length=0.05, sample_rate=SR)
+        f = make_filter(audio_length=0.05, sample_rate=SR)
         x = torch.randn(2, 2, 3, int(0.05 * SR))
         y = f(x)
         self.assertEqual(y.shape, x.shape)
@@ -182,11 +177,11 @@ class TestSampleRateHandling(unittest.TestCase):
     which had zero statement coverage in the original suite."""
 
     def test_resampled_impulse_response_length_tracks_the_rate(self):
-        base = HumanHearingSensitivityFilter(audio_length=0.05, sample_rate=SR)
+        base = make_filter(audio_length=0.05, sample_rate=SR)
         n_base = base.impulse_response.shape[-1]
         for sr in (16000, 22050, 48000):
             with self.subTest(sample_rate=sr):
-                f = HumanHearingSensitivityFilter(audio_length=0.05, sample_rate=sr)
+                f = make_filter(audio_length=0.05, sample_rate=sr)
                 expected = round(n_base * sr / SR)
                 self.assertAlmostEqual(f.impulse_response.shape[-1], expected, delta=4)
 
@@ -371,7 +366,7 @@ class TestImpulseResponseValidation(unittest.TestCase):
     """
 
     def _build(self, ir):
-        return HumanHearingSensitivityFilter(
+        return make_filter(
             audio_length=0.05, sample_rate=SR, impulse_response=ir, impulse_response_sample_rate=SR)
 
     def test_multichannel_ir_is_rejected(self):
