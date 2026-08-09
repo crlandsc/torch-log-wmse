@@ -107,6 +107,16 @@ class TestUpstreamParity(unittest.TestCase):
         u = rng.uniform(-1, 1, (2, SR)).astype(np.float32)
         self._assert_parity(u, (u * 0.1).astype(np.float32), np.zeros_like(u), "stereo")
 
+    # Per-frequency tolerances, measured rather than guessed. A tone that starts and stops at the
+    # buffer edges rings through the filter, and 1.0.0 counts that ring where upstream's trimmed
+    # window discarded it. The effect is largest where the weighting attenuates hardest, because
+    # the steady-state energy it is measured against is smallest there - 1.5e-02 at 60 Hz falling
+    # to ~1e-04 above 1 kHz. See test_the_tone_divergence_is_an_edge_effect for the demonstration.
+    #
+    # These stay four orders of magnitude tighter than a genuinely wrong weighting curve, which
+    # moves values by whole units, so the test keeps doing its job.
+    TONE_TOL = {60.0: 3e-2, 200.0: 2e-3, 1000.0: 1e-3, 3000.0: 1e-3, 7000.0: 1e-3}
+
     def test_frequency_dependent_error(self):
         # A tone error exercises the weighting curve, so this would catch a filter that is subtly
         # wrong in shape even when broadband cases agree.
@@ -114,10 +124,14 @@ class TestUpstreamParity(unittest.TestCase):
         u = rng.uniform(-1, 1, (1, SR)).astype(np.float32)
         t = (rng.uniform(-1, 1, (1, SR)) * 0.2).astype(np.float32)
         tt = np.arange(SR) / SR
-        for freq in (60.0, 200.0, 1000.0, 3000.0, 7000.0):
+        for freq, tol in self.TONE_TOL.items():
             with self.subTest(freq=freq):
                 p = (t + 0.01 * np.sin(2 * np.pi * freq * tt)).astype(np.float32)
-                self._assert_parity(u, p, t, f"{freq:.0f} Hz tone error")
+                ref, got = float(_upstream(u, p, t, SR)), _torch_metric(u, p, t)
+                self.assertAlmostEqual(
+                    got, ref, delta=tol,
+                    msg=f"{freq:.0f} Hz tone: this port {got!r} vs upstream {ref!r} "
+                        f"(delta {abs(got - ref):.3e}, allowed {tol:.0e})")
 
     def test_exact_match_and_all_silence(self):
         rng = np.random.default_rng(19)
@@ -227,6 +241,37 @@ class TestDivergenceIsDeliberate(unittest.TestCase):
     If a future change made them agree at 16 kHz, that would mean the resampling strategy had changed,
     which is a decision that should be explicit rather than silent.
     """
+
+    @unittest.skipIf(_upstream is None, "log-wmse-audio-quality not installed")
+    def test_the_tone_divergence_is_an_edge_effect(self):
+        """Demonstrates WHY tone errors need looser tolerances than broadband ones.
+
+        1.0.0 scores the energy of the full linear convolution; upstream scores a trimmed window
+        the same length as the input. The two differ by exactly the filter's ring-in and ring-out
+        at the buffer edges - so confining the residual away from those edges must make the
+        difference collapse, and it does: 1.5e-02 to 1.2e-03 at 60 Hz, 8.0e-04 to 8.8e-05 at
+        200 Hz. Above 1 kHz both sit at the ~1e-04 float32 floor already.
+
+        If this ever stops shrinking, the divergence is NOT the trim and something else is wrong.
+        """
+        rng = np.random.default_rng(17)
+        u = rng.uniform(-1, 1, (1, SR)).astype(np.float32)
+        t = (rng.uniform(-1, 1, (1, SR)) * 0.2).astype(np.float32)
+        tt = np.arange(SR) / SR
+        guard = np.ones(SR, dtype=np.float32)
+        guard[:4100] = 0  # a little over the 4000-tap impulse response, at both ends
+        guard[-4100:] = 0
+
+        for freq in (60.0, 200.0):
+            with self.subTest(freq=freq):
+                tone = 0.01 * np.sin(2 * np.pi * freq * tt)
+                to_edges = (t + tone).astype(np.float32)
+                off_edges = (t + tone * guard).astype(np.float32)
+                wide = abs(_torch_metric(u, to_edges, t) - float(_upstream(u, to_edges, t, SR)))
+                narrow = abs(_torch_metric(u, off_edges, t) - float(_upstream(u, off_edges, t, SR)))
+                self.assertLess(narrow * 5, wide,
+                                f"{freq:.0f} Hz: keeping the residual off the edges barely helped "
+                                f"({wide:.3e} -> {narrow:.3e}), so the divergence is not the trim")
 
     @unittest.skipIf(_upstream is None, "log-wmse-audio-quality not installed")
     def test_16k_diverges_from_upstream(self):

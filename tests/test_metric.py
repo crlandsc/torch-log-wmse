@@ -16,7 +16,6 @@ import torch
 # filter. Constructing through it is what keeps the 1.0.0 constructor changes to one edit.
 from tests.conftest import make_filter, make_loss
 from torch_log_wmse.utils import calculate_rms, convert_decibels_to_amplitude_ratio
-from torch_log_wmse.freq_weighting_filter import prepare_impulse_response_fft
 
 # Test alias package
 # from torch_log_wmse_audio_quality import LogWMSE
@@ -42,13 +41,16 @@ class TestLogWMSELoss(unittest.TestCase):
 
     def test_calculate_log_wmse(self):
         print("Test calculate_log_wmse")
-        log_wmse_loss = make_loss(audio_length=1.0, sample_rate=44100)
-        input_rms = torch.ones(2, 2)
+        log_wmse_loss = make_loss(sample_rate=44100)
+        # [batch, channel, stem=1] so it broadcasts against the per-element energy. It was [batch,
+        # channel] while the scaling was applied to the waveform, which carried a time axis to
+        # broadcast into; the energy has none, so the stem axis has to be explicit.
+        input_mean_square = torch.ones(2, 2, 1)
         processed_audio = torch.ones(2, 2, 3, 44100)  # [batch, channel, stem, time]
         target_audio = torch.ones(2, 2, 3, 44100)  # [batch, channel, stem, time]
 
         values = log_wmse_loss._calculate_log_wmse(
-            input_rms,
+            input_mean_square,
             log_wmse_loss.filters,
             processed_audio,
             target_audio,
@@ -235,55 +237,44 @@ class TestLogWMSELoss(unittest.TestCase):
         print(f"No reduction loss shape: {none_loss.shape}")
 
 class TestFreqWeightingFilter(unittest.TestCase):
+    """The filter reports weighted ENERGY per [batch, channel, stem], not a filtered waveform.
+
+    The waveform is never materialised: the metric only needs its energy, and Parseval gives that
+    from the forward transform alone. That is what removes the inverse transform, the group-delay
+    correction and the trim.
+
+    The plotting block that used to live here went with the waveform, which also leaves this suite
+    with no matplotlib reference of any kind. `tests/test_invariants.py` carries the behavioural
+    checks - a delta impulse response reproducing the unfiltered score, the one-sided Parseval
+    weights, and the per-size cache.
+    """
+
     def setUp(self):
-        # Example audio data, replace with actual audio loading if needed
-        self.plot_output = False
         self.sample_rate = 44100
         self.audio_length = 3.7516936
-        tone = 440 # sine wave in Hz
-        # float64 deliberately, matching what numpy produced here before: it keeps this test exercising
-        # the filter's dtype promotion against a float32 impulse response.
-        t = torch.arange(int(self.audio_length*self.sample_rate), dtype=torch.float64) / self.sample_rate
-        self.audio = 0.5 * torch.sin(2 * math.pi * tone * t) # create sine wave
+        tone = 440  # sine wave in Hz
+        # float64 deliberately: it keeps this test exercising dtype promotion against a float32
+        # impulse response, and the weights being built in the INPUT's dtype rather than the IR's.
+        t = torch.arange(int(self.audio_length * self.sample_rate), dtype=torch.float64) / self.sample_rate
+        self.audio = 0.5 * torch.sin(2 * math.pi * tone * t)
         # Shape to [batch=1, channel=1, stem=1, time]
         self.audio = self.audio[None, None, None, :]
 
-    def test_prepare_impulse_response_fft(self):
-        print("Test prepare_impulse_response_fft")
-        ir = torch.rand(512)  # Example impulse response
-        fft_size = 1024
-        ir_fft = prepare_impulse_response_fft(ir, fft_size)
-        self.assertEqual(ir_fft.shape[-1], fft_size//2+1)
+    def test_returns_energy_per_element(self):
+        energy = make_filter(sample_rate=self.sample_rate)(self.audio)
+        self.assertEqual(energy.shape, self.audio.shape[:-1])  # the time axis is consumed
+        self.assertEqual(energy.dtype, torch.float64)  # follows the input, not the float32 IR
+        self.assertTrue(torch.isfinite(energy).all())
+        self.assertGreater(float(energy), 0.0)
 
-    def test_HumanHearingSensitivityFilter(self):
-        print("Test HumanHearingSensitivityFilter")
-        plot_upper_bound = 500
-        hhs_filter = make_filter(audio_length=self.audio_length, sample_rate=self.sample_rate)
-        # Add zeros at index 50-100 to demonstrate time alignment
-        self.audio[:, :, :, 50:100] = 0
-        self.audio[:, :, :, 101:125] = 0.5
-        self.audio[:, :, :, 126:150] = -0.5
-        self.audio[:, :, :, 151:200] = 0
-
-        filtered_audio = hhs_filter(self.audio)
-
-        # Plot the first 1000 samples before and after filtering
-        if self.plot_output:
-            import matplotlib.pyplot as plt  # local: an interactive-debug aid, not a test dependency
-
-            fig, axs = plt.subplots(2, 1, figsize=(12, 8))
-            axs[0].plot(self.audio.squeeze()[:plot_upper_bound])
-            axs[0].set_title(f'Original Audio (First {plot_upper_bound} Samples)')
-            axs[0].set_ylim(-1, 1)
-            axs[1].plot(filtered_audio.squeeze()[:plot_upper_bound])
-            axs[1].set_title(f'Filtered Audio (First {plot_upper_bound} Samples)')
-            axs[1].set_ylim(-1, 1)
-            plt.tight_layout()
-            plt.show()
-        else:
-            print("Plotting disabled.")
-
-        self.assertEqual(filtered_audio.shape, self.audio.shape)
+    def test_a_440_hz_tone_is_attenuated_less_than_a_10_khz_one(self):
+        """A shape check on the weighting curve itself: hearing sensitivity peaks in the low kHz,
+        so an equal-amplitude 10 kHz tone must come back with less energy than 440 Hz."""
+        f = make_filter(sample_rate=self.sample_rate)
+        n = self.audio.shape[-1]
+        t = torch.arange(n, dtype=torch.float64) / self.sample_rate
+        high = (0.5 * torch.sin(2 * math.pi * 10000 * t))[None, None, None, :]
+        self.assertGreater(float(f(self.audio)), float(f(high)))
 
 
 if __name__ == "__main__":

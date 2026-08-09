@@ -71,9 +71,16 @@ def _residual(shape, kind, seed):
     elif kind == "click_end":
         r = torch.zeros(shape)
         r[..., -64:] = _rand((*shape[:-1], 64), seed)
-    elif kind == "single":
+    elif kind == "single_mid":
         r = torch.zeros(shape)
         r[..., n // 2] = 1.0
+    elif kind == "single_edge":
+        # AT the boundary, which is where a single-sample residual is maximally sensitive to the
+        # trim: the old window kept only the half of the filter's ring that fell inside it.
+        # Measured -0.7748 at every n, against -0.0008 for the same impulse 100 samples in and
+        # ~0.0000 by 2000 samples in. Position matters far more than length.
+        r = torch.zeros(shape)
+        r[..., 0] = 1.0
     else:
         raise ValueError(f"unknown residual shape {kind!r}")
     return r / max(float(r.pow(2).mean().sqrt()), 1e-30)
@@ -192,7 +199,7 @@ def cases():
     # each one's delta is pinned separately rather than hidden inside a blanket tolerance.
     # -30 dB puts them ~79x above the inaudibility gate, so the gate is inert and its later removal
     # does not contaminate the measurement of the trim.
-    for shape in ("white", "tone", "click_start", "click_end", "single"):
+    for shape in ("white", "tone", "click_start", "click_end", "single_mid", "single_edge"):
         for n in (4096, SR):
             out.append(_spec(f"shape_{shape}_n{n}", "shape", shape=shape, n=n, level=0.0316, seed=11))
 

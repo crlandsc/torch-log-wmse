@@ -110,6 +110,18 @@ class TestGoldenMatrixIsMeaningful(unittest.TestCase):
                     self.assertGreater(max(flat) - min(flat), 20.0,
                                        f"{name} spread collapsed to {max(flat) - min(flat):.2f}")
 
+    def test_an_identical_residual_scores_the_same_at_the_edge_and_in_the_middle(self):
+        """A standing check that the time-domain trim has not come back.
+
+        These two cases are the same single-sample residual placed at sample 0 and at n/2. With the
+        trim they differed by 0.7748, because the old window kept only half the filter's ring at the
+        boundary. They must now be identical.
+        """
+        for n in (4096, 44100):
+            with self.subTest(n=n):
+                self.assertAlmostEqual(self.golden[f"shape_single_edge_n{n}"]["pooled"],
+                                       self.golden[f"shape_single_mid_n{n}"]["pooled"], delta=TOL)
+
     def test_gain_cases_are_scale_invariant(self):
         """Recorded rather than derived, so a regression in scale invariance shows up as a value."""
         self.assertAlmostEqual(self.golden["gain0.001"]["pooled"],

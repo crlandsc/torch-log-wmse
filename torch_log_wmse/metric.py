@@ -10,13 +10,37 @@ import torch
 from torch import Tensor
 from typing import Callable, Optional
 
-from torch_log_wmse.constants import ERROR_TOLERANCE_THRESHOLD, SCALER, EPS, RMS_EPS
+from torch_log_wmse.constants import SCALER, EPS, RMS_EPS
 from torch_log_wmse.freq_weighting_filter import HumanHearingSensitivityFilter
-from torch_log_wmse.utils import VALID_REDUCTIONS, apply_reduction, calculate_rms
+from torch_log_wmse.utils import VALID_REDUCTIONS, apply_reduction
+
+
+def accumulation_dtype(dtype: torch.dtype) -> torch.dtype:
+    """The dtype energies are summed in: never below float32.
+
+    Energies are squares, so half precision gets strictly worse here than it is for the signal
+    itself - and `RMS_EPS**2 = 1e-16`, the floor that keeps a silent mixture finite, underflows to
+    exactly 0.0 in float16.
+    """
+    return dtype if dtype in (torch.float32, torch.float64) else torch.float32
+
+
+def weighted_energy(
+    signal: Tensor, filters: Callable, bypass_filter: bool = False
+) -> Tensor:
+    """Total energy of `signal` after frequency weighting, per [batch, channel, stem].
+
+    `bypass_filter` takes the time-domain route on purpose rather than filtering with a flat
+    response: it is the only path that works in half precision, because `torch.fft` has no half
+    kernel on CPU or MPS.
+    """
+    if bypass_filter:
+        return signal.to(accumulation_dtype(signal.dtype)).pow(2).sum(dim=-1)
+    return filters(signal)
 
 
 def per_element_mse(
-    input_rms: Tensor,
+    input_mean_square: Tensor,
     filters: Callable,
     processed_audio: Tensor,
     target_audio: Tensor,
@@ -29,9 +53,27 @@ def per_element_mse(
     computed while leaving the score unchanged, and the pooling change replaces how these values
     combine while leaving this untouched.
 
+    The floor is `RMS_EPS**2`, not `RMS_EPS`: the clamp applies to a MEAN SQUARE here, where it
+    used to apply to an RMS that was subsequently squared. Getting that wrong scales a silent
+    mixture by 1e4 instead of 1e8. RMS_EPS is a FLOOR rather than an addend, so the scaling stays
+    exactly 1/rms for every non-degenerate input; adding it would bias very quiet mixtures.
+
+    The scaling is FOLDED INTO THE DIVISOR rather than multiplied through the waveform. The filter
+    is linear, so `E(filter(k*d)) == k^2 * E(filter(d))`, and dividing once at the end avoids an
+    O(N) multiply and a full-size temporary.
+
+    Both forms were measured, because dividing afterwards looks like it should be worse
+    conditioned - the transform sees data spread over the input's full dynamic range instead of
+    normalised to unit RMS. It is not. Exact joint-gain invariance holds either way (bit-identical
+    at 2^-10 versus 2^10), the extremes behave identically, and on inputs that are NOT exactly
+    proportional in binary - 1e-3 versus 1e3 - folding in is marginally the more accurate of the
+    two (2.4e-07 against 7.2e-07). The residual difference there is the inputs, not the metric:
+    `u * 1e-3` and `u * 1e3` are not exactly a factor of 1e6 apart in float32.
+
     Args:
-        input_rms (Tensor): RMS of the (filtered) mixture. Shape [batch, channel, stem].
-        filters (Callable): The frequency-weighting filter.
+        input_mean_square (Tensor): Mean square of the (weighted) mixture. Broadcasts against
+            [batch, channel, stem].
+        filters (Callable): The frequency-weighting filter, which returns ENERGY.
         processed_audio (Tensor): [batch, channel, stem, time].
         target_audio (Tensor): [batch, channel, stem, time].
         bypass_filter (bool): Skip the frequency weighting.
@@ -39,35 +81,11 @@ def per_element_mse(
     Returns:
         Tensor: [batch, channel, stem].
     """
-    # Calculate the scaling factor based on the input RMS. RMS_EPS is a FLOOR rather than an
-    # addend: clamping leaves the scaling factor exactly 1/input_rms for every non-degenerate
-    # input, so joint-gain scale invariance holds exactly, whereas adding RMS_EPS biases very
-    # quiet mixtures. Both forms give an identical value for a digitally silent mixture.
-    scaling_factor = 1 / torch.clamp_min(input_rms, RMS_EPS)
-
-    # Add extra dimension(s) to scaling_factor to match the shape of processed_audio and target_audio
-    while scaling_factor.dim() < processed_audio.dim():
-        scaling_factor = scaling_factor.unsqueeze(-1)
-
-    # Calculate the frequency-weighted differences, ignoring small imperceptible differences.
-    # The filter is linear, so filters(a) - filters(b) == filters(a - b); taking the difference first
-    # halves the filtered signals and so removes one rfft/irfft pair per call.
-    # Skip frequency weighting if bypass_filter is True.
-    differences = (processed_audio - target_audio) * scaling_factor
-    if not bypass_filter:
-        differences = filters(differences)
-
-    # Discard differences too small to be audible. torch.where rather than an in-place masked
-    # assignment: it avoids a data-dependent scatter, which keeps the graph friendly to
-    # torch.compile. Note it does NOT save memory - both forms build the full-size boolean
-    # condition, and where() additionally allocates a new output buffer.
-    differences = torch.where(
-        torch.abs(differences) < ERROR_TOLERANCE_THRESHOLD,
-        torch.zeros((), dtype=differences.dtype, device=differences.device),
-        differences,
-    )
-
-    return (differences**2).mean(dim=-1)
+    differences = processed_audio - target_audio
+    n_samples = differences.shape[-1]
+    energy = weighted_energy(differences, filters, bypass_filter)
+    floor = torch.clamp_min(input_mean_square.to(energy.dtype), RMS_EPS**2)
+    return energy / (n_samples * floor)
 
 
 def score_from_mse(mse: Tensor) -> Tensor:
@@ -110,12 +128,14 @@ class LogWMSE(torch.nn.Module):
     * Overcomes the small value range issue of MSE (i.e. between 1e-8 and 1e-3), making number
         formatting and sight-reading easier. Scaled similar to SI-SDR.
     * Scale-invariant, aligns with the frequency sensitivity of human hearing.
-    * Invariant to the tiny errors of MSE that are inaudible to humans.
     * Logarithmic, reflecting the logarithmic sensitivity of human hearing.
     * Tailored specifically for audio signals.
 
+    One instance serves ANY input length and any stem count. The transform size is derived from the
+    input and its weights cached, so nothing is pinned at construction. Note the SAMPLE RATE cannot
+    be inferred the same way - the impulse response is resampled to it - so it stays an argument.
+
     Args:
-        audio_length (float): The length of the audio signal in seconds. May be fractional.
         sample_rate (int, optional): The sample rate of the audio signal in Hz. Defaults to 44100.
         impulse_response (Tensor, optional): The finite impulse response (FIR) filter for
             frequency weighting. If None (default), use built-in FIR. Currently only supports
@@ -128,7 +148,6 @@ class LogWMSE(torch.nn.Module):
     """
     def __init__(
             self,
-            audio_length: float,
             sample_rate: int = 44100,
             impulse_response: Optional[Tensor] = None,
             impulse_response_sample_rate: int = 44100,
@@ -137,8 +156,8 @@ class LogWMSE(torch.nn.Module):
             reduction: str = "mean",
         ):
         super().__init__()
+        self.sample_rate = sample_rate
         self.filters = HumanHearingSensitivityFilter(
-            audio_length=audio_length,
             sample_rate=sample_rate,
             impulse_response=impulse_response,
             impulse_response_sample_rate=impulse_response_sample_rate,
@@ -185,29 +204,19 @@ class LogWMSE(torch.nn.Module):
                 f"length mismatch: unprocessed_audio has {unprocessed_audio.shape[-1]} samples, "
                 f"processed_audio has {processed_audio.shape[-1]}"
             )
-        # The filter truncates to the length configured at construction, so a mismatch would silently
-        # score a different window than the caller passed - and bypass_filter=True would not truncate
-        # at all, making the two paths disagree on which samples they scored.
-        # audio_length * sample_rate is rarely an exact integer, and floor() vs round() differ by one
-        # sample for many fractional lengths (22 of the 399 hundredth-second values at 44.1 kHz). A
-        # caller who sized their segment with round() is not making a mistake, so accept either.
-        expected = self.filters.audio_length_samples
-        if unprocessed_audio.shape[-1] not in (expected, expected + 1):
-            raise ValueError(
-                f"expected {expected} samples for the configured audio_length "
-                f"(floor(audio_length * sample_rate); {expected + 1} is also accepted for callers who "
-                f"round up), got {unprocessed_audio.shape[-1]}. Construct a LogWMSE for this length, "
-                "or trim/pad the input to match."
-            )
+        # No length check against a configured audio_length: there is no configured length any more.
+        # The transform size is derived from whatever arrives, so the whole error class - including
+        # the floor()-versus-round() off-by-one it had to tolerate - is gone.
 
-        if self.bypass_filter:
-            input_rms = calculate_rms(unprocessed_audio.unsqueeze(2))  # [batch, channel, time] -> [batch, channel, stem=1, time]
-        else:
-            input_rms = calculate_rms(self.filters(unprocessed_audio.unsqueeze(2)))  # [batch, channel, time] -> [batch, channel, stem=1, time]
+        # Mean square of the weighted mixture, per [batch, channel, stem=1] so it broadcasts.
+        mixture = unprocessed_audio.unsqueeze(2)  # [batch, channel, time] -> [b, c, stem=1, time]
+        input_mean_square = (
+            weighted_energy(mixture, self.filters, self.bypass_filter) / mixture.shape[-1]
+        )
 
         # Calculate the logWMSE
         values = self._calculate_log_wmse(
-            input_rms,
+            input_mean_square,
             self.filters,
             processed_audio,
             target_audio,
@@ -224,7 +233,7 @@ class LogWMSE(torch.nn.Module):
 
     @staticmethod
     def _calculate_log_wmse(
-        input_rms: Tensor,
+        input_mean_square: Tensor,
         filters: Callable,
         processed_audio: Tensor,
         target_audio: Tensor,
@@ -234,8 +243,8 @@ class LogWMSE(torch.nn.Module):
         Calculate the logWMSE between the processed audio and target audio.
 
         Args:
-            input_rms (Tensor): The root mean square of the input audio. Shape: [batch, channel, stem].
-            filters (Callable): A function that applies a filter to the audio (i.e. HumanHearingSensitivityFilter).
+            input_mean_square (Tensor): The mean square of the weighted mixture. Shape: [batch, channel, stem].
+            filters (Callable): Returns the weighted ENERGY of a signal (i.e. HumanHearingSensitivityFilter).
             processed_audio (Tensor): The processed audio tensor. Shape: [batch, channel, stem, time].
             target_audio (Tensor): The target audio tensor. Shape: [batch, channel, stem, time].
             bypass_filter (bool, optional): Whether to bypass the frequency weighting filter. Defaults to False.
@@ -244,5 +253,5 @@ class LogWMSE(torch.nn.Module):
             Tensor: The logWMSE between the processed audio and target audio.
         """
         return score_from_mse(
-            per_element_mse(input_rms, filters, processed_audio, target_audio, bypass_filter)
+            per_element_mse(input_mean_square, filters, processed_audio, target_audio, bypass_filter)
         )

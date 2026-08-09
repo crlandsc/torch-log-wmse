@@ -28,7 +28,8 @@ import unittest
 # metric and the filter. Constructing through it is what keeps the 1.0.0 constructor changes to one
 # edit rather than forty.
 from tests.conftest import CEILING, SR, make_filter, make_metric, per_element
-from torch_log_wmse.constants import EPS, ERROR_TOLERANCE_THRESHOLD, SCALER
+from torch_log_wmse.constants import EPS, SCALER
+from torch_log_wmse.freq_weighting_filter import next_fft_friendly_size, parseval_weights
 
 # Module-local alias, so the call sites below stay as they are.
 _metric = make_metric
@@ -41,11 +42,10 @@ class TestClosedFormOracle(unittest.TestCase):
     SCALER*ln(k^2 + EPS). This is derivation-backed, unlike a golden value recorded from this
     implementation.
 
-    The closed form holds only while k stays well clear of ERROR_TOLERANCE_THRESHOLD (3.98e-4): the
-    scaled differences have RMS exactly k, so once k approaches the threshold a growing fraction of
-    samples is legitimately zeroed and the measured mse drops below k^2. At k=1e-3 the threshold is
-    0.4 * RMS and roughly a third of the samples are discounted, so the oracle is asserted only for
-    k >= 1e-2, which is ~25x the threshold.
+    The oracle now holds at EVERY k. It used to break down below about 1e-3, because the -68 dB
+    per-sample inaudibility gate zeroed a growing fraction of the samples and the measured mse fell
+    below k^2. That gate is gone in 1.0.0, so the range where the derivation applies is no longer
+    bounded from below - which is itself the cleanest evidence the gate really has been removed.
     """
 
     def test_scaled_input_against_silent_target(self):
@@ -59,20 +59,24 @@ class TestClosedFormOracle(unittest.TestCase):
                 expected = SCALER * math.log(k * k + EPS)
                 self.assertAlmostEqual(float(m(u, p, t)), expected, places=3)
 
-    def test_threshold_discounts_error_below_its_level(self):
-        # The complement of the oracle above: well below the threshold the metric must read BETTER than
-        # the closed form, because sub-threshold samples are deliberately discounted. Measured offsets
-        # from the closed form are +0.06 at k=1e-3, +0.82 at k=4e-4 and +2.77 at k=1e-4, so k=1e-4 gives
-        # an unambiguous signal. (The offset stays small until k is comparable to the threshold because
-        # the discarded samples are the low-ENERGY ones, not merely the numerous ones.)
+    def test_the_oracle_now_holds_below_the_old_inaudibility_gate(self):
+        """The former complement of the test above, inverted by removing the gate.
+
+        With the -68 dB gate in place, k = 1e-4 read +2.77 units BETTER than the closed form,
+        because sub-threshold samples were discounted. It must now match the closed form like any
+        other level. This is the regression guard against the gate coming back.
+        """
         torch.manual_seed(0)
         m = _metric()
         u = (torch.rand(1, 1, SR) * 2 - 1)
-        k = 1e-4
-        p = (u * k).unsqueeze(2)
-        got = float(m(u, p, torch.zeros_like(p)))
-        naive = SCALER * math.log(k * k + EPS)
-        self.assertGreater(got, naive + 1.0)
+        for k in (1e-3, 4e-4, 1e-4):
+            with self.subTest(k=k):
+                p = (u * k).unsqueeze(2)
+                got = float(m(u, p, torch.zeros_like(p)))
+                expected = SCALER * math.log(k * k + EPS)
+                self.assertAlmostEqual(got, expected, places=2,
+                                       msg=f"k={k}: {got} vs closed form {expected}; a "
+                                           f"{got - expected:+.2f} offset means error is being discounted")
 
     def test_exact_match_hits_the_ceiling(self):
         torch.manual_seed(1)
@@ -85,65 +89,157 @@ class TestClosedFormOracle(unittest.TestCase):
         self.assertAlmostEqual(CEILING, 73.68272, places=4)
 
 
-class TestFilterIsZeroPhase(unittest.TestCase):
-    """A symmetric delta impulse response must pass a signal through unchanged.
+class TestFilterPhaseIsIrrelevant(unittest.TestCase):
+    """The replacement for the old zero-phase tests, and a stronger check than they were.
 
-    Kills M07 (shift removed), M08/M09 (shift +/-1 sample) and M20 (asymmetric padding), and would have
-    caught the odd-length-IR misalignment (finding A2) that the original suite could not detect.
+    The score depends on the filter only through `|H|^2`, so the filter's PHASE cannot affect it at
+    all. Two consequences worth asserting: a delta impulse response anywhere gives exactly the
+    unfiltered score, and rolling the impulse response changes nothing.
+
+    The delta-IR case is the single most valuable test in this file. It fails if the one-sided
+    Parseval doubling is missing (a clean 4*ln(2) = 2.7726 offset), if the energy is divided by the
+    transform size instead of the sample count, or if the transform is shorter than n + m - 1 and
+    the result is a circular convolution. Those three are otherwise near-invisible: two of them
+    read as plausible numbers and the third looks like FFT noise.
+
+    NOTE this is about the FILTER's phase. The metric is emphatically NOT phase-invariant with
+    respect to the signals - the error is `estimate - target`, so a latency offset between the two
+    is fully penalised.
     """
 
-    def _roundtrip_offset(self, ir_len, n=512):
-        ir = torch.zeros(ir_len)
-        ir[(ir_len - 1) // 2] = 1.0
-        f = make_filter(
-            audio_length=n / SR, sample_rate=SR,
-            impulse_response=ir, impulse_response_sample_rate=SR)
-        x = torch.zeros(1, 1, 1, n)
-        x[0, 0, 0, n // 2] = 1.0
-        y = f(x)
-        return int(torch.argmax(torch.abs(y))) - n // 2, float((y - x[0, 0, 0]).abs().max())
+    def _case(self, n=512, seed=0):
+        torch.manual_seed(seed)
+        u = torch.rand(1, 1, n) * 2 - 1
+        p = (torch.rand(1, 1, 1, n) * 2 - 1) * 0.1
+        return u, p, torch.zeros_like(p)
 
-    def test_delta_ir_is_transparent_for_even_and_odd_lengths(self):
-        # Odd lengths are the regression guard for A2; even lengths cover the shipped 4000-tap IR.
+    def test_a_delta_ir_anywhere_equals_the_unfiltered_score(self):
+        u, p, t = self._case()
+        reference = float(_metric(bypass_filter=True)(u, p, t))
+        # Odd IR lengths were the regression guard for the group-delay misalignment (finding A2);
+        # they now also cover the transform-size parity that the Nyquist weight depends on.
         for ir_len in (2, 3, 4, 51, 100, 101, 999, 1000, 1001):
-            with self.subTest(ir_len=ir_len):
-                offset, err = self._roundtrip_offset(ir_len)
-                self.assertEqual(offset, 0, f"delta IR of length {ir_len} shifted the signal by {offset}")
-                self.assertLess(err, 1e-5)
+            for position in (0, (ir_len - 1) // 2, ir_len - 1):
+                with self.subTest(ir_len=ir_len, position=position):
+                    ir = torch.zeros(ir_len)
+                    ir[position] = 1.0
+                    m = _metric(impulse_response=ir, impulse_response_sample_rate=SR)
+                    self.assertAlmostEqual(
+                        float(m(u, p, t)), reference, places=3,
+                        msg=f"delta IR (len {ir_len}, tap at {position}) read "
+                            f"{float(m(u, p, t))} against an unfiltered {reference}")
 
-    def test_builtin_filter_preserves_length_and_is_finite(self):
-        f = make_filter(audio_length=0.05, sample_rate=SR)
-        x = torch.randn(2, 2, 3, int(0.05 * SR))
-        y = f(x)
-        self.assertEqual(y.shape, x.shape)
-        self.assertTrue(torch.isfinite(y).all())
+    def test_delaying_the_ir_changes_nothing(self):
+        """A pure delay is a phase change and nothing else, so the score must not move.
+
+        Delay by PREPENDING ZEROS, not by `torch.roll` on the tap array. Rolling wraps the last
+        taps around to the front, and once that array is zero-padded to the transform size those
+        taps sit in the wrong place entirely - a different filter with a different |H|, which
+        legitimately scores differently (measured up to 0.15 units). That is a property of the
+        test, not of the metric.
+        """
+        u, p, t = self._case(seed=1)
+        torch.manual_seed(9)
+        ir = torch.rand(256) - 0.5
+        base = float(_metric(impulse_response=ir, impulse_response_sample_rate=SR)(u, p, t))
+        for delay in (1, 7, 128, 1000):
+            with self.subTest(delay=delay):
+                delayed = torch.cat([torch.zeros(delay), ir])
+                got = float(_metric(impulse_response=delayed, impulse_response_sample_rate=SR)(u, p, t))
+                self.assertAlmostEqual(got, base, places=4,
+                                       msg=f"a {delay}-sample delay moved the score {base} -> {got}")
+
+    def test_builtin_filter_returns_finite_energy_per_element(self):
+        f = make_filter()
+        x = torch.randn(2, 2, 3, 2048)
+        energy = f(x)
+        self.assertEqual(energy.shape, (2, 2, 3))  # energy per element, not a filtered signal
+        self.assertTrue(torch.isfinite(energy).all())
+        self.assertTrue((energy > 0).all())
 
 
-class TestErrorToleranceThreshold(unittest.TestCase):
-    """The -68 dB tolerance must actually discount sub-threshold error.
+class TestParsevalWeights(unittest.TestCase):
+    """Unit tests for the weight vector, where the one-sided sum is easy to get wrong in silence.
 
-    Kills M24 (tolerance zeroing deleted) and M06 (threshold changed), which the original suite let through.
+    `w[f] = |H(f)|^2 * c[f] / L`, with c = 1 at DC, 2 for interior bins, and 1 at the last bin for
+    even L or 2 for odd L. Three separate mistakes live in that one line, so each is targeted by a
+    signal that concentrates its energy exactly where the mistake would show:
+
+      * interior bins not doubled -> a broadband signal is off by a factor of ~2
+      * DC bin doubled            -> invisible on broadband (one bin in thousands), obvious on DC
+      * Nyquist parity ignored    -> invisible unless L is odd AND the signal sits at the top bin
     """
 
-    def test_uniform_subthreshold_error_reaches_the_ceiling(self):
+    LENGTHS = (512, 513, 1024, 1025)  # both parities, deliberately
+
+    def _signal(self, kind, n):
+        if kind == "random":
+            torch.manual_seed(5)
+            return torch.rand(n) * 2 - 1
+        if kind == "dc":
+            return torch.ones(n)
+        if kind == "nyquist":  # alternating +/-1: all energy in the top bin
+            return torch.where(torch.arange(n) % 2 == 0, 1.0, -1.0)
+        raise ValueError(kind)
+
+    def test_weights_reproduce_the_time_domain_energy(self):
+        torch.manual_seed(6)
+        ir = torch.rand(64) - 0.5
+        n = 256
+        for length in self.LENGTHS:
+            for kind in ("random", "dc", "nyquist"):
+                with self.subTest(transform_size=length, signal=kind, parity=length % 2):
+                    x = self._signal(kind, n)
+                    spectrum = torch.fft.rfft(x, n=length)
+                    got = float(((spectrum.real**2 + spectrum.imag**2)
+                                 * parseval_weights(ir, length)).sum())
+                    # Reference: the convolution actually performed, summed in the time domain.
+                    filtered = torch.fft.irfft(
+                        torch.fft.rfft(x, n=length) * torch.fft.rfft(ir, n=length), n=length)
+                    want = float(filtered.pow(2).sum())
+                    self.assertAlmostEqual(got / want, 1.0, places=4,
+                                           msg=f"L={length} {kind}: {got} vs {want} "
+                                               f"(ratio {got / want:.6f})")
+
+    def test_a_missing_doubling_would_be_a_factor_of_two(self):
+        """Pins the size of the mistake, so the failure above is recognisable when it happens."""
+        # A delta IR has |H| = 1 in every bin, so w is exactly c / L and the coefficients are bare.
+        w = parseval_weights(torch.tensor([1.0, 0.0]), 512)
+        interior = w[1:-1] * 512
+        self.assertTrue(torch.allclose(interior, torch.full_like(interior, 2.0), atol=1e-5),
+                        "interior bins are not doubled; every value will be 4*ln(2) = 2.7726 low")
+        self.assertAlmostEqual(float(w[0] * 512), 1.0, places=5, msg="DC must be counted once")
+        self.assertAlmostEqual(float(w[-1] * 512), 1.0, places=5,
+                               msg="Nyquist must be counted once for an EVEN transform size")
+        odd = parseval_weights(torch.tensor([1.0, 0.0]), 513)
+        self.assertAlmostEqual(float(odd[-1] * 513), 2.0, places=5,
+                               msg="the top bin of an ODD transform is an ordinary conjugate pair")
+
+
+class TestInaudibilityGateIsGone(unittest.TestCase):
+    """The -68 dB per-sample gate was removed in 1.0.0. These pin its absence.
+
+    It could not survive computing energy in the frequency domain - a per-SAMPLE gate needs a
+    time-domain signal. Its measured effect across the reachable range was 0.000, and reaching the
+    band where it mattered needs 74-80 dB SI-SDR.
+    """
+
+    def test_uniform_subthreshold_error_is_scored_not_discarded(self):
         n = 4096
-        m = _metric(audio_length=n / SR, bypass_filter=True)
+        m = _metric(bypass_filter=True)
         u = torch.ones(1, 1, n)
         t = torch.zeros(1, 1, 1, n)
-        below = torch.full((1, 1, 1, n), float(ERROR_TOLERANCE_THRESHOLD) * 0.5)
-        self.assertAlmostEqual(float(m(u, below, t)), CEILING, places=4)
+        k = 10 ** (-68.0 / 20) * 0.5  # half the old threshold: formerly zeroed outright
+        below = torch.full((1, 1, 1, n), k)
+        expected = SCALER * math.log(k * k + EPS)
+        self.assertAlmostEqual(float(m(u, below, t)), expected, places=3)
+        self.assertLess(float(m(u, below, t)), CEILING - 1.0,
+                        "sub-threshold error is still being discarded")
 
-    def test_error_exactly_at_threshold_is_not_discounted(self):
-        # The comparison is a strict `<`, so a difference equal to the threshold must survive.
-        n = 4096
-        m = _metric(audio_length=n / SR, bypass_filter=True)
-        u = torch.ones(1, 1, n)
-        t = torch.zeros(1, 1, 1, n)
-        at = torch.full((1, 1, 1, n), float(ERROR_TOLERANCE_THRESHOLD))
-        self.assertLess(float(m(u, at, t)), CEILING - 1.0)
+    def test_the_constant_no_longer_exists(self):
+        import torch_log_wmse.constants as constants
 
-    def test_threshold_constant_is_minus_68_db(self):
-        self.assertAlmostEqual(float(ERROR_TOLERANCE_THRESHOLD), 10 ** (-68.0 / 20), places=9)
+        self.assertFalse(hasattr(constants, "ERROR_TOLERANCE_THRESHOLD"))
 
 
 class TestBypassFilter(unittest.TestCase):
@@ -442,12 +538,21 @@ class TestSilenceGradients(unittest.TestCase):
         catches that. (The exact mutant value depends on calculate_rms's floor, so it is deliberately
         not quoted here; two fixes guard this failure by different mechanisms and each needs its own
         test, which is what the mutation study established.)
+
+        BOTH VALUES MOVED BY EXACTLY -4*ln(2) = -2.7726 IN 1.0.0, AND THAT IS NOT THE PARSEVAL BUG.
+        The estimate here is a CONSTANT, and the weighting filter heavily attenuates DC, so almost
+        all of the filtered energy sits in the two edge transients where the constant switches on
+        and off. The old centred window captured exactly half of each - a ratio of 2.0000 measured
+        at n = 4096, 22050, 44100 and 220500 alike - and dropping the trim recovers the other half.
+        A missing one-sided doubling produces the same 2.7726 signature but on EVERY input; this
+        appears only on DC-dominated ones. If both this and the broadband cases shift by 2.7726,
+        suspect the weights; if only this one does, it is the trim.
         """
         n = 4096
         m = _metric(audio_length=n / SR, reduction="none")
         z = torch.zeros(1, 1, n)
         t = torch.zeros(1, 1, 1, n)
-        for level, expected in ((1e-3, -71.93113), (1e-2, -90.35181)):
+        for level, expected in ((1e-3, -74.70372), (1e-2, -93.12440)):
             with self.subTest(level=level):
                 got = float(m(z, torch.full((1, 1, 1, n), level), t))
                 self.assertTrue(math.isfinite(got))
@@ -493,12 +598,38 @@ class TestInputValidation(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "same shape"):
             self.m(self.u, self.p, torch.zeros(2, 2, 1, self.n))
 
-    def test_length_mismatch_with_configured_audio_length_raises(self):
-        # Previously the filtered path silently scored only the first audio_length_samples while
-        # bypass_filter=True scored everything, so the two disagreed by up to 26 units.
-        longer = self.n * 2
-        with self.assertRaisesRegex(ValueError, "expected"):
-            self.m(torch.rand(2, 2, longer), torch.rand(2, 2, 3, longer), torch.zeros(2, 2, 3, longer))
+    def test_any_length_is_accepted_by_the_same_instance(self):
+        """The replacement for the old length-mismatch error, which no longer exists.
+
+        `audio_length` used to pin one length per instance, and a mismatch had to raise because the
+        filtered path silently scored only the first audio_length_samples while bypass_filter=True
+        scored everything - the two disagreed by up to 26 units. The transform size is now derived
+        from the input, so there is nothing to mismatch.
+        """
+        for n in (self.n, self.n * 2, 22050, 44100, 12345):
+            with self.subTest(n=n):
+                got = float(self.m(torch.rand(2, 2, n),
+                                   torch.rand(2, 2, 3, n) * 0.1,
+                                   torch.zeros(2, 2, 3, n)))
+                self.assertTrue(math.isfinite(got))
+
+    def test_the_two_paths_agree_on_which_samples_they_scored(self):
+        """The property the old length check was protecting, asserted directly.
+
+        A delta impulse response makes the filtered path mathematically identical to the bypass
+        path, so any disagreement about the scored window shows up immediately.
+        """
+        for n in (1024, 4096, 44100):
+            with self.subTest(n=n):
+                torch.manual_seed(n)
+                u = torch.rand(1, 1, n) * 2 - 1
+                p = (torch.rand(1, 1, 1, n) * 2 - 1) * 0.1
+                t = torch.zeros_like(p)
+                delta = torch.tensor([1.0, 0.0])
+                filtered = float(_metric(impulse_response=delta,
+                                         impulse_response_sample_rate=SR)(u, p, t))
+                bypassed = float(_metric(bypass_filter=True)(u, p, t))
+                self.assertAlmostEqual(filtered, bypassed, places=3)
 
     def test_bad_reduction_raises_at_construction(self):
         for bad in ("Mean", "average", "batchmean", "", None):
@@ -641,13 +772,12 @@ class TestApplyReductionDirectly(unittest.TestCase):
 
 
 class TestConstructorValidation(unittest.TestCase):
-    """audio_length and sample_rate must be validated, not left to fail opaquely later."""
+    """sample_rate must be validated, not left to fail opaquely later.
 
-    def test_degenerate_audio_length_raises(self):
-        for bad in (0, -1.0, 1e-9):
-            with self.subTest(audio_length=bad):
-                with self.assertRaisesRegex(ValueError, "at least 1 sample"):
-                    _metric(audio_length=bad)
+    The audio_length checks that used to live here are gone with the argument itself. A whole class
+    of error disappeared with it: nothing can now be configured inconsistently with the input,
+    because nothing about the input is configured.
+    """
 
     def test_non_positive_sample_rate_raises(self):
         for bad in (0, -44100):
@@ -659,23 +789,20 @@ class TestConstructorValidation(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "impulse_response_sample_rate must be positive"):
             _metric(audio_length=1.0, impulse_response_sample_rate=0)
 
-    def test_fractional_audio_length_accepts_floor_or_round(self):
-        # floor() and round() of audio_length * sample_rate differ by one sample for many fractional
-        # lengths (22 of the 399 hundredth-second values at 44.1 kHz). Rejecting the round() form
-        # would fail callers who sized their segments the ordinary way.
-        for length in (0.35, 0.57, 0.69, 0.7):
-            with self.subTest(audio_length=length):
-                m = _metric(audio_length=length)
-                for n in (math.floor(length * SR), round(length * SR)):
-                    out = m(torch.rand(1, 1, n), torch.rand(1, 1, 1, n), torch.zeros(1, 1, 1, n))
-                    self.assertTrue(math.isfinite(float(out)))
+    def test_one_instance_serves_lengths_that_used_to_need_separate_instances(self):
+        """Including the floor()/round() pair that the old length check had to special-case.
 
-    def test_length_still_rejects_a_real_mismatch(self):
-        m = _metric(audio_length=1.0)
-        for n in (SR // 2, SR * 2, SR + 100):
-            with self.subTest(n=n):
-                with self.assertRaisesRegex(ValueError, "expected"):
-                    m(torch.rand(1, 1, n), torch.rand(1, 1, 1, n), torch.zeros(1, 1, 1, n))
+        `audio_length * sample_rate` is rarely an exact integer, and floor() and round() differ by
+        one sample for 22 of the 399 hundredth-second values at 44.1 kHz. That forced the old
+        validation to accept both, which was a workaround for a constraint that no longer exists.
+        """
+        m = _metric()
+        for length in (0.35, 0.57, 0.69, 0.7):
+            for n in (math.floor(length * SR), round(length * SR)):
+                with self.subTest(audio_length=length, n=n):
+                    out = m(torch.rand(1, 1, n), torch.rand(1, 1, 1, n) * 0.1,
+                            torch.zeros(1, 1, 1, n))
+                    self.assertTrue(math.isfinite(float(out)))
 
 
 class TestRmsFloorIsDtypeCorrect(unittest.TestCase):
@@ -754,7 +881,6 @@ class TestModuleContract(unittest.TestCase):
         self.assertEqual(m.filters.impulse_response.device.type, "cpu")
         moved = m.to("meta")
         self.assertEqual(moved.filters.impulse_response.device.type, "meta")
-        self.assertEqual(moved.filters.impulse_response_fft.device.type, "meta")
 
     def test_forward_does_not_mutate_module_state(self):
         """No device reassignment, and nothing else rebound during the pass.
@@ -763,10 +889,23 @@ class TestModuleContract(unittest.TestCase):
         graph capture, which is why the old compensation had to go rather than merely be tidied.
         """
         m = _metric(audio_length=self.N / SR)
-        before = (m.filters.impulse_response.data_ptr(), m.filters.impulse_response_fft.data_ptr())
+        before = m.filters.impulse_response.data_ptr()
         m(*self._triplet())
-        after = (m.filters.impulse_response.data_ptr(), m.filters.impulse_response_fft.data_ptr())
-        self.assertEqual(before, after, "forward rebound a buffer")
+        self.assertEqual(before, m.filters.impulse_response.data_ptr(), "forward rebound a buffer")
+
+    def test_the_weight_cache_is_not_a_buffer(self):
+        """DDP enumerates named_buffers() to build its broadcast list.
+
+        A cache that grows lazily would give ranks divergent buffer lists - they process different
+        data, so they reach different lengths at different times - and the collective then either
+        hangs or mismatches. Non-persistent does not help: those still appear in named_buffers().
+        """
+        m = _metric(audio_length=self.N / SR)
+        m(*self._triplet())
+        self.assertTrue(m.filters._weights, "nothing was cached, so this test proves nothing")
+        names = [n for n, _ in m.named_buffers()]
+        self.assertEqual(names, ["filters.impulse_response"],
+                         f"cache entries leaked into named_buffers(): {names}")
 
     @unittest.skipUnless(torch.backends.mps.is_available(), "no MPS device")
     def test_mps_matches_cpu(self):
@@ -780,6 +919,143 @@ class TestModuleContract(unittest.TestCase):
         cpu = float(m(*self._triplet()))
         gpu = float(m.to("mps")(*self._triplet("mps")))
         self.assertAlmostEqual(gpu, cpu, delta=1e-4, msg=f"mps {gpu} vs cpu {cpu}")
+
+
+class TestEdgeRingIsNowCounted(unittest.TestCase):
+    """The one semantic change in the filtering rewrite, pinned rather than left implicit.
+
+    The metric moved from "energy of a window the same length as the input" to "energy of the full
+    linear convolution", so the filter's ring-in and ring-out at the buffer edges are now counted
+    instead of discarded.
+
+    The user-visible consequence is an improvement, and it is the reason to state the change as a
+    feature rather than an erratum: AN IDENTICAL ERROR NOW SCORES THE SAME WHEREVER IT OCCURS IN
+    THE BUFFER. The old trimmed window kept only the half of the filter's ring that happened to
+    fall inside it, so the same single-sample error read 0.7748 units BETTER at the buffer boundary
+    than in the middle - purely because half its energy was discarded. Measured identically at
+    n = 2048, 4096, 44100 and 220500, because the discarded pre-ring was a fixed fraction of that
+    transient's own energy rather than of the window's; 100 samples in it was already down to
+    0.0008, and by half the impulse response's length it was 0.0000.
+
+    So the size of the difference from the old implementation depends on POSITION far more than on
+    length or sparsity. "Sparse residuals shift" is misleading; "residuals at the buffer edges
+    shift" is accurate.
+    """
+
+    N = 8192
+
+    def _score_with_impulse_at(self, position, **kw):
+        torch.manual_seed(77)
+        u = torch.rand(1, 1, self.N) * 2 - 1
+        t = torch.zeros(1, 1, 1, self.N)
+        p = torch.zeros(1, 1, 1, self.N)
+        p[0, 0, 0, position] = 0.01
+        return float(_metric(**kw)(u, p, t))
+
+    def test_the_score_no_longer_depends_on_where_the_residual_sits(self):
+        """The property the trim used to break. Under it, position 0 read 0.7748 units better."""
+        scores = {pos: self._score_with_impulse_at(pos)
+                  for pos in (0, 1, 100, 2000, self.N // 2, self.N - 1)}
+        spread = max(scores.values()) - min(scores.values())
+        self.assertLess(spread, 1e-3,
+                        f"an identical error scores differently by position: {scores}")
+
+    def test_it_holds_for_a_burst_as_well_as_a_single_sample(self):
+        torch.manual_seed(78)
+        burst = torch.rand(64) * 0.02
+        scores = []
+        for start in (0, 1000, self.N // 2, self.N - 64):
+            u = torch.rand(1, 1, self.N) * 2 - 1
+            t = torch.zeros(1, 1, 1, self.N)
+            p = torch.zeros(1, 1, 1, self.N)
+            p[0, 0, 0, start:start + 64] = burst
+            torch.manual_seed(77)
+            u = torch.rand(1, 1, self.N) * 2 - 1
+            scores.append(float(_metric()(u, p, t)))
+        self.assertLess(max(scores) - min(scores), 1e-3, f"burst position changed the score: {scores}")
+
+
+class TestTransformSizing(unittest.TestCase):
+    """Size selection, and the cache keyed on it."""
+
+    def test_next_size_is_the_smallest_even_smooth_value(self):
+        """Checked against brute force, because an off-by-one here is silent: any size at or above
+        the requirement is CORRECT, just slower, so only a size BELOW it breaks anything."""
+        def brute(n):
+            k = max(n, 2)
+            while True:
+                if k % 2 == 0:
+                    r = k
+                    for prime in (2, 3, 5):
+                        while r % prime == 0:
+                            r //= prime
+                    if r == 1:
+                        return k
+                k += 1
+
+        for n in list(range(2, 400)) + [4096, 12345, 48099, 92199, 65537]:
+            with self.subTest(n=n):
+                self.assertEqual(next_fft_friendly_size(n), brute(n))
+
+    def test_the_headline_size_beats_the_power_of_two(self):
+        # 1 s at 44.1 kHz needs 48099 samples: 48600 as a 5-smooth number against 65536 as a power
+        # of two, cutting padding waste from 36% to 1%.
+        self.assertEqual(next_fft_friendly_size(48099), 48600)
+
+    def test_transform_is_never_shorter_than_the_linear_convolution(self):
+        """`L >= n + m - 1` is correctness, not performance: Parseval over a shorter L returns the
+        CIRCULAR convolution energy, which used to show as visible wrap-around and is now silent."""
+        f = make_filter()
+        m = f.impulse_response.shape[-1]
+        for n in (1, 2, 100, 1024, 4096, 44100, 62000, 220500):
+            with self.subTest(n=n):
+                self.assertGreaterEqual(f.transform_size(n), n + m - 1)
+
+    def test_lengths_that_share_a_transform_size_share_one_cache_entry(self):
+        """Keyed on the transform size, not the input length.
+
+        Keying on the input length is not wrong - the weights depend only on the transform size, so
+        both give identical numbers - but it silently rebuilds the weights for every new length,
+        which is the entire cost the cache exists to avoid. Only an entry count can see it.
+        """
+        f = make_filter()
+        a, b = 44100, 44101
+        self.assertEqual(f.transform_size(a), f.transform_size(b),
+                         "pick two lengths that actually share a size, or this proves nothing")
+        for n in (a, b):
+            f(torch.rand(1, 1, 1, n))
+        self.assertEqual(len(f._weights), 1, f"expected one cache entry, got {len(f._weights)}")
+
+    def test_dtype_is_part_of_the_cache_key(self):
+        """A float32 entry reused for a float64 call would silently downgrade the whole computation,
+        and the float64 gradcheck along with it - while still returning a float64 tensor."""
+        n = 1024
+        shared = make_filter()
+        x32 = torch.rand(1, 1, 1, n)
+        shared(x32)                                   # populate with float32 first
+        reused = shared(x32.double())
+        fresh = make_filter()(x32.double())
+        self.assertEqual(reused.dtype, torch.float64)
+        self.assertTrue(torch.equal(reused, fresh),
+                        "a float64 call after a float32 call did not match a fresh instance")
+        self.assertEqual(len(shared._weights), 2)
+
+    def test_the_cache_is_capped(self):
+        f = make_filter(cache_size=3)
+        for n in (1000, 2000, 4000, 8000, 16000, 32000):
+            f(torch.rand(1, 1, 1, n))
+        self.assertLessEqual(len(f._weights), 3)
+
+    def test_a_single_instance_reproduces_per_length_instances(self):
+        """The whole point of dropping audio_length: one instance, any length, same numbers."""
+        shared = _metric()
+        for n in (512, 4096, 22050, 44100, 62000):
+            with self.subTest(n=n):
+                torch.manual_seed(n)
+                u = torch.rand(1, 1, n) * 2 - 1
+                p = (torch.rand(1, 1, 2, n) * 2 - 1) * 0.1
+                t = torch.zeros_like(p)
+                self.assertAlmostEqual(float(shared(u, p, t)), float(_metric()(u, p, t)), places=6)
 
 
 class TestAggregationContract(unittest.TestCase):

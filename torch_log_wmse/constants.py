@@ -6,10 +6,12 @@ FFT convolution in place of scipy.signal.oaconvolve, batched [batch, channel, st
 API, differentiable loss support, and the impulse-response/silence handling described in the
 README and CHANGELOG.
 """
-from torch_log_wmse.utils import convert_decibels_to_amplitude_ratio
-
-# Error tolerance threshold, relative to 0 dB RMS
-ERROR_TOLERANCE_THRESHOLD = convert_decibels_to_amplitude_ratio(-68.0)
+# ERROR_TOLERANCE_THRESHOLD (a -68 dB per-sample inaudibility gate) was removed in 1.0.0. It could
+# not survive the move to computing energy in the frequency domain - a per-SAMPLE gate needs a
+# time-domain signal, and there no longer is one. Its measured effect across the reachable range was
+# 0.000: identical values from -10 dB down to -40 dB residual, and reaching the band where it
+# mattered at all needs 74-80 dB SI-SDR. Exact digital silence still returns the ceiling either way,
+# so the headline feature never depended on it. Removing it also deletes a zero-gradient dead zone.
 
 # This scaler makes the scale of values closer to SDR, where an increase
 # in the tenths place is a meaningful improvement. The goal is to make it easier to

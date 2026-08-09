@@ -41,7 +41,11 @@ SR = 44100
 CEILING = float(SCALER * math.log(EPS))  # +73.6827..., the value for an exact match
 
 
-def make_metric(audio_length=1.0, sample_rate=SR, **kw):
+# `audio_length` is accepted and IGNORED. It used to pin one input length per instance; the
+# transform size is now derived from whatever arrives, so one instance serves any length. Keeping
+# the argument here rather than deleting it from every call site is the whole point of routing
+# construction through factories: the constructor change is this comment and three signatures.
+def make_metric(audio_length=None, sample_rate=SR, **kw):
     """The POSITIVE metric: higher is better.
 
     `return_as_loss` is accepted and forwarded so that call sites which deliberately exercise both
@@ -49,22 +53,18 @@ def make_metric(audio_length=1.0, sample_rate=SR, **kw):
     disappears from the public API - callers do not change.
     """
     kw.setdefault("return_as_loss", False)
-    return LogWMSE(audio_length=audio_length, sample_rate=sample_rate, **kw)
+    return LogWMSE(sample_rate=sample_rate, **kw)
 
 
-def make_loss(audio_length=1.0, sample_rate=SR, **kw):
+def make_loss(audio_length=None, sample_rate=SR, **kw):
     """The LOSS: the negated metric, for training."""
     kw["return_as_loss"] = True
-    return LogWMSE(audio_length=audio_length, sample_rate=sample_rate, **kw)
+    return LogWMSE(sample_rate=sample_rate, **kw)
 
 
-def make_filter(audio_length=1.0, sample_rate=SR, **kw):
-    """The frequency-weighting filter on its own.
-
-    `audio_length` is what pins the transform size today; it is derived from the input later, so
-    this argument becomes inert rather than disappearing from call sites.
-    """
-    return HumanHearingSensitivityFilter(audio_length=audio_length, sample_rate=sample_rate, **kw)
+def make_filter(audio_length=None, sample_rate=SR, **kw):
+    """The frequency-weighting filter on its own. Returns weighted ENERGY, not a filtered signal."""
+    return HumanHearingSensitivityFilter(sample_rate=sample_rate, **kw)
 
 
 def per_element(u, p, t, **kw):
