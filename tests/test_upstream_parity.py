@@ -64,16 +64,15 @@ def _torch_per_element(unprocessed, processed, target, sample_rate=SR):
     `processed`/`target` may carry a stem axis: [channel, stem, time]. `unprocessed` is always
     [channel, time], since the mixture has no stems.
 
-    This is the one place that reads unreduced values. When `reduction` narrows to the batch axis,
-    this becomes `per_stem(...)` and nothing else in the module changes.
+    This is the one place that reads unreduced values, and `per_stem` is now what provides them -
+    `reduction` controls only the batch axis.
     """
-    audio_length = unprocessed.shape[-1] / sample_rate
-    m = make_metric(audio_length=audio_length, sample_rate=sample_rate, reduction="none")
+    m = make_metric(sample_rate=sample_rate)
     u = _as_batch(unprocessed)[None]
     p, t = torch.from_numpy(processed), torch.from_numpy(target)
     if p.ndim == 2:  # [channel, time] -> [channel, stem=1, time]
         p, t = p[:, None, :], t[:, None, :]
-    return m(u, p[None], t[None])[0].tolist()  # [channel][stem]
+    return m.per_stem(u, p[None], t[None])[0].tolist()  # [channel][stem]
 
 
 @unittest.skipIf(_upstream is None, "log-wmse-audio-quality not installed (needs scipy + soxr)")

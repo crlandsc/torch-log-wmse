@@ -28,8 +28,10 @@ import unittest
 # metric and the filter. Constructing through it is what keeps the 1.0.0 constructor changes to one
 # edit rather than forty.
 from tests.conftest import CEILING, SR, make_filter, make_metric, per_element
+from torch_log_wmse import LogWMSE, LogWMSELoss
 from torch_log_wmse.constants import EPS, SCALER
 from torch_log_wmse.freq_weighting_filter import next_fft_friendly_size, parseval_weights
+from torch_log_wmse.utils import VALID_REDUCTIONS
 
 # Module-local alias, so the call sites below stay as they are.
 _metric = make_metric
@@ -341,24 +343,120 @@ class TestNoSideEffects(unittest.TestCase):
             self.assertEqual(float(m(u, p, t)), first)
 
 
+class TestClassSplit(unittest.TestCase):
+    """`LogWMSE` (higher is better) and `LogWMSELoss` (lower is better) replace `return_as_loss`.
+
+    A flag that silently inverts a training objective is not worth the convenience of one import:
+    forget it and the model optimises away from the target while every number still looks
+    plausible. Two classes make the sign visible at the call site.
+    """
+
+    N = 4096
+
+    def _case(self, seed=51):
+        torch.manual_seed(seed)
+        u = torch.rand(2, 2, self.N) * 2 - 1
+        t = torch.rand(2, 2, 3, self.N) * 2 - 1
+        return u, t + (torch.rand(2, 2, 3, self.N) * 2 - 1) * 0.1, t
+
+    def test_the_loss_is_the_negated_metric_for_every_reduction(self):
+        u, p, t = self._case()
+        for reduction in VALID_REDUCTIONS:
+            with self.subTest(reduction=reduction):
+                metric = LogWMSE(reduction=reduction)
+                loss = LogWMSELoss(reduction=reduction)
+                self.assertTrue(torch.equal(loss(u, p, t), -metric(u, p, t)))
+
+    def test_per_stem_negates_too(self):
+        """Otherwise `loss.per_stem()` would silently disagree in sign with `loss()`."""
+        u, p, t = self._case()
+        self.assertTrue(torch.equal(LogWMSELoss().per_stem(u, p, t),
+                                    -LogWMSE().per_stem(u, p, t)))
+
+    def test_the_loss_is_a_real_subclass(self):
+        # So isinstance checks, .to(), state_dict() and every other Module behaviour carry over
+        # rather than being reimplemented.
+        self.assertIsInstance(LogWMSELoss(), LogWMSE)
+
+    def test_both_are_exported(self):
+        import torch_log_wmse
+
+        self.assertEqual(set(torch_log_wmse.__all__), {"LogWMSE", "LogWMSELoss"})
+
+    def test_removed_arguments_raise_by_name(self):
+        """Silently ignoring them would let a caller believe a length or a sign had been set."""
+        with self.assertRaisesRegex(TypeError, "return_as_loss was removed"):
+            LogWMSE(return_as_loss=True)
+        with self.assertRaisesRegex(TypeError, "audio_length was removed"):
+            LogWMSE(audio_length=1.0)
+
+    def test_the_constructor_is_keyword_only(self):
+        """The trap this closes: `audio_length` used to be FIRST.
+
+        A positional call written for an earlier version would otherwise put a duration where
+        `sample_rate` now is and quietly build a metric at 1 Hz, which raises nothing and returns
+        numbers.
+        """
+        with self.assertRaises(TypeError):
+            LogWMSE(1.0)
+        with self.assertRaises(TypeError):
+            LogWMSE(1.0, 44100)
+
+    def test_p_is_validated(self):
+        for bad in (-1.0, -0.5, float("nan"), float("inf")):
+            with self.subTest(p=bad):
+                with self.assertRaisesRegex(ValueError, "p must be a finite, non-negative"):
+                    LogWMSE(p=bad)
+        for good in (0, 0.5, 1, 2.0):
+            with self.subTest(p=good):
+                self.assertEqual(LogWMSE(p=good).p, float(good))
+
+    def test_p_appears_in_the_repr_along_with_the_sample_rate(self):
+        # sample_rate is the one thing that still cannot be inferred from the input, so a caller who
+        # has just learned that length is automatic should be able to see the rate is not.
+        text = repr(LogWMSE(sample_rate=48000, p=0.5))
+        self.assertIn("sample_rate=48000", text)
+        self.assertIn("p=0.5", text)
+
+
 class TestReductionSemantics(unittest.TestCase):
-    """Reduction must pin the correct axis and relate mean/sum/none exactly.
+    """`reduction` controls the BATCH axis and nothing else, as in any other torch loss.
+
+    It used to reduce over [batch, channel, stem] together. Channel and stem are now pooled by `p`
+    first, so "none" returns one value per batch item rather than one per element, and "sum" is a
+    sum over the batch rather than over every element. Both changes are asserted below rather than
+    merely observed, because "sum" quietly changing by a factor of channels x stems is exactly the
+    sort of thing that reads as a plausible number downstream.
 
     Kills M21 (mean over wrong dim) and M13 (mean/sum swapped).
     """
 
-    def test_none_mean_sum_are_mutually_consistent(self):
+    def test_none_mean_sum_are_mutually_consistent_over_the_batch(self):
         torch.manual_seed(8)
         b, c, s, n = 2, 2, 3, 8192
         u = (torch.rand(b, c, n) * 2 - 1)
         p = (torch.rand(b, c, s, n) * 2 - 1) * 0.1
         t = torch.zeros_like(p)
-        none = _metric(audio_length=n / SR, reduction="none")(u, p, t)
-        mean = float(_metric(audio_length=n / SR, reduction="mean")(u, p, t))
-        total = float(_metric(audio_length=n / SR, reduction="sum")(u, p, t))
-        self.assertEqual(none.shape, (b, c, s))
+        none = _metric(reduction="none")(u, p, t)
+        mean = float(_metric(reduction="mean")(u, p, t))
+        total = float(_metric(reduction="sum")(u, p, t))
+        self.assertEqual(none.shape, (b,), "reduction='none' must give one value per batch item")
         self.assertAlmostEqual(float(none.mean()), mean, places=4)
         self.assertAlmostEqual(float(none.sum()), total, places=2)
+        # sum/mean is now the BATCH size. It was batch x channels x stems, i.e. 12 for this case.
+        self.assertAlmostEqual(total / mean, b, places=3)
+
+    def test_pooling_is_over_channel_and_stem_only(self):
+        """The identity that makes p=0 exactly the old behaviour, and the batch axis untouched."""
+        torch.manual_seed(21)
+        b, c, s, n = 3, 2, 4, 4096
+        u = (torch.rand(b, c, n) * 2 - 1)
+        p = (torch.rand(b, c, s, n) * 2 - 1) * 0.1
+        t = torch.zeros_like(p)
+        m = _metric(reduction="none")
+        self.assertTrue(
+            torch.allclose(m(u, p, t), m.per_stem(u, p, t).mean(dim=(1, 2)), atol=1e-5),
+            "at p=0 the pooled value must be the mean of the per-stem values, exactly")
 
     def test_per_entry_values_survive_batch_reduction(self):
         # The original suite asserted values only for batch size 1; this pins multi-entry reduction.
@@ -367,10 +465,10 @@ class TestReductionSemantics(unittest.TestCase):
         u = (torch.rand(2, 1, n) * 2 - 1)
         t = torch.zeros(2, 1, 1, n)
         p = torch.stack([u[0] * 0.1, u[1] * 0.01]).unsqueeze(2)
-        none = _metric(audio_length=n / SR, reduction="none")(u, p, t).flatten()
+        none = _metric(reduction="none")(u, p, t).flatten()
         self.assertAlmostEqual(float(none[0]), SCALER * math.log(0.1 ** 2), places=2)
         self.assertAlmostEqual(float(none[1]), SCALER * math.log(0.01 ** 2), places=2)
-        mean = float(_metric(audio_length=n / SR, reduction="mean")(u, p, t))
+        mean = float(_metric(reduction="mean")(u, p, t))
         self.assertAlmostEqual(mean, float(none.mean()), places=4)
 
 
@@ -1072,9 +1170,15 @@ class TestAggregationContract(unittest.TestCase):
     """
 
     N = 2048
-    # Both filter paths, and both float dtypes the filter supports. float16 cannot reach the
-    # filtering path at all (no half FFT kernel on CPU or MPS) and is covered separately.
-    VARIANTS = [(dt, bp) for dt in (torch.float32, torch.float64) for bp in (False, True)]
+    # Both filter paths, both float dtypes the filter supports, and three pooling exponents. float16
+    # cannot reach the filtering path at all (no half FFT kernel on CPU or MPS) and is covered
+    # separately. p is in the sweep because these properties have to hold for EVERY p - that is what
+    # makes them the contract rather than a description of one setting, and it is what lets the
+    # default move from 0 to 1/2 with the contract already proven at both.
+    VARIANTS = [(dt, bp, p)
+                for dt in (torch.float32, torch.float64)
+                for bp in (False, True)
+                for p in (0.0, 0.5, 1.0)]
 
     def _graded(self, levels, dtype=torch.float32, seed=41):
         """levels[c][s] = that element's residual amplitude, relative to the mixture."""
@@ -1092,10 +1196,10 @@ class TestAggregationContract(unittest.TestCase):
         function of the parts, and it is the property most at risk from a pooling change.
         """
         levels = [[0.316, 0.05, 0.01], [0.1, 0.02, 0.003]]
-        for dtype, bypass in self.VARIANTS:
-            with self.subTest(dtype=dtype, bypass_filter=bypass):
+        for dtype, bypass, power in self.VARIANTS:
+            with self.subTest(dtype=dtype, bypass_filter=bypass, p=power):
                 u, p, t = self._graded(levels, dtype)
-                kw = dict(audio_length=self.N / SR, bypass_filter=bypass)
+                kw = dict(bypass_filter=bypass, p=power)
                 elements = per_element(u, p, t, **kw).flatten()
                 pooled = float(_metric(**kw)(u, p, t))
                 # Guards the guard: bracketing is trivially true when the elements are equal, so a
@@ -1110,12 +1214,12 @@ class TestAggregationContract(unittest.TestCase):
     def test_monotonicity(self):
         """Improving any single element never worsens the aggregate."""
         base = [[0.2, 0.05], [0.1, 0.02]]
-        for dtype, bypass in self.VARIANTS:
-            kw = dict(audio_length=self.N / SR, bypass_filter=bypass)
+        for dtype, bypass, power in self.VARIANTS:
+            kw = dict(bypass_filter=bypass, p=power)
             before = float(_metric(**kw)(*self._graded(base, dtype)))
             for c in range(2):
                 for s in range(2):
-                    with self.subTest(dtype=dtype, bypass_filter=bypass, element=(c, s)):
+                    with self.subTest(dtype=dtype, bypass_filter=bypass, p=power, element=(c, s)):
                         better = [row[:] for row in base]
                         better[c][s] *= 0.5  # halve one element's residual, leave the rest
                         after = float(_metric(**kw)(*self._graded(better, dtype)))
@@ -1129,8 +1233,8 @@ class TestAggregationContract(unittest.TestCase):
         True under every pooling rule - a power mean of identical values is that value - which is
         why the familiar single-number reading survives the redesign unchanged.
         """
-        for dtype, bypass in self.VARIANTS:
-            with self.subTest(dtype=dtype, bypass_filter=bypass):
+        for dtype, bypass, power in self.VARIANTS:
+            with self.subTest(dtype=dtype, bypass_filter=bypass, p=power):
                 torch.manual_seed(43)
                 # Identical mixture across channels AND an identical residual on every element, so
                 # the per-element values are bit-identical rather than merely close.
@@ -1139,7 +1243,7 @@ class TestAggregationContract(unittest.TestCase):
                 d = (torch.rand(1, 1, 1, self.N) * 2 - 1).to(dtype) * 0.05
                 p = t + d
 
-                kw = dict(audio_length=self.N / SR, bypass_filter=bypass)
+                kw = dict(bypass_filter=bypass, p=power)
                 elements = per_element(u, p, t, **kw).flatten()
                 self.assertLess(float(elements.max() - elements.min()), 1e-4,
                                 "the construction is not actually equal-quality")
@@ -1150,10 +1254,10 @@ class TestAggregationContract(unittest.TestCase):
 
         Guards against an aggregation change silently altering the most common usage of all.
         """
-        for dtype, bypass in self.VARIANTS:
-            with self.subTest(dtype=dtype, bypass_filter=bypass):
+        for dtype, bypass, power in self.VARIANTS:
+            with self.subTest(dtype=dtype, bypass_filter=bypass, p=power):
                 u, p, t = self._graded([[0.08]], dtype)
-                kw = dict(audio_length=self.N / SR, bypass_filter=bypass)
+                kw = dict(bypass_filter=bypass, p=power)
                 element = float(per_element(u, p, t, **kw).flatten()[0])
                 self.assertAlmostEqual(float(_metric(**kw)(u, p, t)), element, places=5)
 
@@ -1272,9 +1376,9 @@ class TestLowPrecisionDtypes(unittest.TestCase):
     def test_bit_exact_stem_is_finite_and_hits_the_float32_ceiling(self):
         for dtype in self.HALF_DTYPES:
             with self.subTest(dtype=dtype):
-                m = _metric(audio_length=1024 / SR, bypass_filter=True, reduction="none")
+                m = _metric(bypass_filter=True)
                 u, p, t = self._triplet(dtype)
-                got = m(u, p, t)
+                got = m.per_stem(u, p, t)
                 self.assertTrue(torch.isfinite(got).all(), f"{dtype} produced {got}")
                 # Stem 0 is bit-exact, so it must read the ceiling - the SAME ceiling float32 gives.
                 self.assertAlmostEqual(float(got[0, 0, 0]), CEILING, places=3)

@@ -229,10 +229,9 @@ def evaluate(spec):
     sample_rate = config.pop("sample_rate", SR)
     audio_length = spec["n"] / sample_rate
 
-    unreduced = make_metric(audio_length=audio_length, sample_rate=sample_rate,
-                            reduction="none", **config)(u, p, t)
-    pooled = make_metric(audio_length=audio_length, sample_rate=sample_rate,
-                         reduction="mean", **config)(u, p, t)
+    metric = make_metric(audio_length=audio_length, sample_rate=sample_rate, **config)
+    unreduced = metric.per_stem(u, p, t)
+    pooled = metric(u, p, t)
 
     result = {
         # Recorded per [batch][channel][stem]. Flattened batch-first so a diff points at one element.
@@ -246,8 +245,7 @@ def evaluate(spec):
         # claim checkable rather than asserted, and it is the only recorded quantity that would
         # catch a NaN gradient - the forward value stays finite.
         pe = p.detach().clone().requires_grad_(True)
-        make_metric(audio_length=audio_length, sample_rate=sample_rate,
-                    reduction="mean", **config)(u, pe, t).backward()
+        metric(u, pe, t).backward()
         result["grad_norms"] = _round(
             [float(pe.grad[:, :, s].norm()) for s in range(pe.shape[2])])
 

@@ -14,7 +14,7 @@ import torch
 # imported lazily inside the one plotting block that uses it (disabled by default).
 # conftest owns the sys.path insertion, the thread cap, and every construction of the metric and the
 # filter. Constructing through it is what keeps the 1.0.0 constructor changes to one edit.
-from tests.conftest import make_filter, make_loss
+from tests.conftest import CEILING, make_filter, make_loss, make_metric
 from torch_log_wmse.utils import calculate_rms, convert_decibels_to_amplitude_ratio
 
 # Test alias package
@@ -39,25 +39,24 @@ class TestLogWMSELoss(unittest.TestCase):
 
                 print(f"Test {i}, RMS Value: {rms.mean()}")
 
-    def test_calculate_log_wmse(self):
-        print("Test calculate_log_wmse")
-        log_wmse_loss = make_loss(sample_rate=44100)
-        # [batch, channel, stem=1] so it broadcasts against the per-element energy. It was [batch,
-        # channel] while the scaling was applied to the waveform, which carried a time axis to
-        # broadcast into; the energy has none, so the stem axis has to be explicit.
-        input_mean_square = torch.ones(2, 2, 1)
-        processed_audio = torch.ones(2, 2, 3, 44100)  # [batch, channel, stem, time]
-        target_audio = torch.ones(2, 2, 3, 44100)  # [batch, channel, stem, time]
+    def test_per_stem(self):
+        """Replaces a test that reached into a private static with a hand-built input_rms.
 
-        values = log_wmse_loss._calculate_log_wmse(
-            input_mean_square,
-            log_wmse_loss.filters,
-            processed_audio,
-            target_audio,
-        )
+        `per_stem` is the public way to get the same values, so the test no longer has to
+        reconstruct the metric's internal call signature to check a shape.
+        """
+        print("Test per_stem")
+        metric = make_metric(sample_rate=44100)
+        unprocessed_audio = torch.rand(2, 2, 44100)          # [batch, channel, time]
+        processed_audio = torch.ones(2, 2, 3, 44100)         # [batch, channel, stem, time]
+        target_audio = torch.ones(2, 2, 3, 44100)
+
+        values = metric.per_stem(unprocessed_audio, processed_audio, target_audio)
 
         self.assertIsInstance(values, torch.Tensor)
         self.assertEqual(values.shape, (2, 2, 3))  # [batch, channel, stem]
+        # An exact match on every stem, so every element is the ceiling.
+        self.assertTrue(torch.allclose(values, torch.full_like(values, CEILING), atol=1e-3))
 
         print(f"Values: {values}")
 
@@ -221,17 +220,17 @@ class TestLogWMSELoss(unittest.TestCase):
         none_log_wmse = make_loss(audio_length=1.0, sample_rate=44100, reduction="none")
         none_loss = none_log_wmse(unprocessed_audio, processed_audio, target_audio)
         self.assertIsInstance(none_loss, torch.Tensor)
-        self.assertEqual(none_loss.shape, (batch, channels, stems))  # Should preserve dimensions
-        
-        # Verify mathematical relationship between mean and sum
-        # The sum should be approximately batch*channels*stems times the mean
-        expected_factor = batch * channels * stems
-        self.assertAlmostEqual(
-            sum_loss.item() / mean_loss.item(),
-            expected_factor,
-            delta=0.1  # Allow some tolerance for floating point differences
-        )
-        
+        # BREAKING CHANGE, asserted deliberately rather than relaxed. `reduction` now controls the
+        # BATCH axis only, like any other torch loss; channel and stem are pooled first. So "none"
+        # is one value per batch item, not one per [batch, channel, stem]. Use per_stem() for those.
+        self.assertEqual(none_loss.shape, (batch,))
+        self.assertEqual(
+            none_log_wmse.per_stem(unprocessed_audio, processed_audio, target_audio).shape,
+            (batch, channels, stems))
+
+        # And sum/mean is now the BATCH size, where it was batch x channels x stems (12 here).
+        self.assertAlmostEqual(sum_loss.item() / mean_loss.item(), batch, delta=0.1)
+
         print(f"Mean reduction loss: {mean_loss.item()}")
         print(f"Sum reduction loss: {sum_loss.item()}")
         print(f"No reduction loss shape: {none_loss.shape}")

@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
-from torch_log_wmse import LogWMSE
+from torch_log_wmse import LogWMSE, LogWMSELoss
 from torch_log_wmse.constants import EPS, SCALER
 from torch_log_wmse.freq_weighting_filter import HumanHearingSensitivityFilter
 
@@ -45,21 +45,20 @@ CEILING = float(SCALER * math.log(EPS))  # +73.6827..., the value for an exact m
 # transform size is now derived from whatever arrives, so one instance serves any length. Keeping
 # the argument here rather than deleting it from every call site is the whole point of routing
 # construction through factories: the constructor change is this comment and three signatures.
-def make_metric(audio_length=None, sample_rate=SR, **kw):
+def make_metric(audio_length=None, sample_rate=SR, return_as_loss=False, **kw):
     """The POSITIVE metric: higher is better.
 
-    `return_as_loss` is accepted and forwarded so that call sites which deliberately exercise both
-    signs keep working. When the class splits, this function chooses the class and the keyword
-    disappears from the public API - callers do not change.
+    `return_as_loss` now selects the CLASS rather than a flag on one class. Call sites that
+    deliberately exercise both signs keep working unchanged; the flag itself is gone from the
+    public API and raises TypeError if passed to the constructor.
     """
-    kw.setdefault("return_as_loss", False)
-    return LogWMSE(sample_rate=sample_rate, **kw)
+    cls = LogWMSELoss if return_as_loss else LogWMSE
+    return cls(sample_rate=sample_rate, **kw)
 
 
 def make_loss(audio_length=None, sample_rate=SR, **kw):
     """The LOSS: the negated metric, for training."""
-    kw["return_as_loss"] = True
-    return LogWMSE(sample_rate=sample_rate, **kw)
+    return LogWMSELoss(sample_rate=sample_rate, **kw)
 
 
 def make_filter(audio_length=None, sample_rate=SR, **kw):
@@ -67,13 +66,17 @@ def make_filter(audio_length=None, sample_rate=SR, **kw):
     return HumanHearingSensitivityFilter(sample_rate=sample_rate, **kw)
 
 
-def per_element(u, p, t, **kw):
+def per_element(unprocessed, processed, target, **kw):
     """Per-[batch, channel, stem] values - the numbers pooling consumes.
 
-    The second adapter, alongside the constructors above: today these come from reduction="none",
-    and when `reduction` narrows to the batch axis they come from `per_stem()`. One edit, here.
+    The positional names are spelled out rather than u/p/t because `p` is now also the name of the
+    pooling exponent, and `per_element(u, p, t, p=0.5)` is a TypeError rather than an obvious typo.
+
+    The second adapter, alongside the constructors above. These used to come from
+    `reduction="none"`; now that `reduction` controls only the batch axis, they come from
+    `per_stem()`.
     """
-    return make_metric(reduction="none", **kw)(u, p, t)
+    return make_metric(**kw).per_stem(unprocessed, processed, target)
 
 
 def bipolar(*shape, seed=None, scale=1.0):
