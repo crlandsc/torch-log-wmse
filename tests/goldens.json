@@ -75,7 +75,7 @@
     ]
    ]
   ],
-  "pooled": -2.783283
+  "pooled": -2.783376
  },
  "bypass_independent": {
   "grad_norms": null,
@@ -91,7 +91,7 @@
     ]
    ]
   ],
-  "pooled": -2.754898
+  "pooled": -2.754902
  },
  "bypass_level-20": {
   "grad_norms": null,
@@ -123,9 +123,9 @@
  "exact_one_stem": {
   "grad_norms": [
    0.0,
-   0.332141,
-   0.332877,
-   0.332445
+   0.443049,
+   0.443091,
+   0.442902
   ],
   "per_element": [
    [
@@ -143,7 +143,7 @@
     ]
    ]
   ],
-  "pooled": 36.392815
+  "pooled": 26.25885
  },
  "gain0.001": {
   "grad_norms": null,
@@ -159,7 +159,7 @@
     ]
    ]
   ],
-  "pooled": -2.786479
+  "pooled": -2.786504
  },
  "gain1000": {
   "grad_norms": null,
@@ -175,7 +175,7 @@
     ]
    ]
   ],
-  "pooled": -2.78648
+  "pooled": -2.786505
  },
  "graded_stereo_2stem": {
   "grad_norms": null,
@@ -191,14 +191,14 @@
     ]
    ]
   ],
-  "pooled": 23.028622
+  "pooled": 17.344995
  },
  "graded_stereo_4stem": {
   "grad_norms": [
-   0.437114,
-   0.907783,
-   1.884961,
-   3.911474
+   0.137715,
+   0.137713,
+   0.137706,
+   0.137677
   ],
   "per_element": [
    [
@@ -216,7 +216,7 @@
     ]
    ]
   ],
-  "pooled": 26.008438
+  "pooled": 16.949362
  },
  "len22050": {
   "grad_norms": null,
@@ -232,7 +232,7 @@
     ]
    ]
   ],
-  "pooled": -2.781255
+  "pooled": -2.781882
  },
  "len4096": {
   "grad_norms": null,
@@ -248,7 +248,7 @@
     ]
    ]
   ],
-  "pooled": -2.797588
+  "pooled": -2.798077
  },
  "len44100": {
   "grad_norms": null,
@@ -264,7 +264,7 @@
     ]
    ]
   ],
-  "pooled": -2.798962
+  "pooled": -2.799045
  },
  "len62000": {
   "grad_norms": null,
@@ -280,7 +280,7 @@
     ]
    ]
   ],
-  "pooled": -2.787148
+  "pooled": -2.787158
  },
  "level-10": {
   "grad_norms": null,
@@ -357,7 +357,7 @@
     ]
    ]
   ],
-  "pooled": -2.848159
+  "pooled": -2.848158
  },
  "shape_click_end_n4096": {
   "grad_norms": null,
@@ -379,7 +379,7 @@
     ]
    ]
   ],
-  "pooled": 27.69375
+  "pooled": 27.693748
  },
  "shape_click_start_n4096": {
   "grad_norms": null,
@@ -505,7 +505,7 @@
     ]
    ]
   ],
-  "pooled": 36.850796
+  "pooled": 36.850773
  },
  "sr48000": {
   "grad_norms": null,
@@ -521,7 +521,7 @@
     ]
    ]
   ],
-  "pooled": -2.753374
+  "pooled": -2.753582
  },
  "stereo_1stem": {
   "grad_norms": null,
@@ -535,7 +535,7 @@
     ]
    ]
   ],
-  "pooled": -2.807843
+  "pooled": -2.807944
  },
  "stereo_2stem": {
   "grad_norms": null,
@@ -551,7 +551,7 @@
     ]
    ]
   ],
-  "pooled": -2.797536
+  "pooled": -2.7976
  },
  "stereo_4stem": {
   "grad_norms": null,
@@ -571,6 +571,6 @@
     ]
    ]
   ],
-  "pooled": -2.800356
+  "pooled": -2.800435
  }
 }

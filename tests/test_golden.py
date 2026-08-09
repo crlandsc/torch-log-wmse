@@ -134,19 +134,38 @@ class TestGoldenMatrixIsMeaningful(unittest.TestCase):
                 self.assertTrue(all(_finite(v) for v in values), f"{name} recorded a non-finite value")
 
 
-class TestPooledMatchesPerElement(unittest.TestCase):
-    """Today pooling is the mean over every axis, so the pooled value IS the mean of the elements.
+class TestPoolingShapesTheRecordedValues(unittest.TestCase):
+    """The recorded values must show the power mean doing its job, not a plain average.
 
-    This survives the redesign as `pooled(p=0) == per_stem().mean(dim=(1,2))`, which is the exact
-    identity that makes the pooling machinery landable at p=0 with a bit-exact gate before the
-    default moves to 1/2.
+    At the default p = 1/2 the pooled value sits at or below the mean of the per-element values,
+    and strictly below it wherever the elements differ. Both halves matter: the inequality is what
+    stops a spread of stem qualities being flattered by the good ones, and equality on uniform
+    cases is what keeps the familiar single-number reading intact.
     """
 
-    def test_pooled_is_the_mean_of_the_elements(self):
+    def test_pooled_never_exceeds_the_mean_of_the_elements(self):
         for name, rec in load().items():
             with self.subTest(case=name):
                 flat = _flatten(rec["per_element"])
-                self.assertAlmostEqual(rec["pooled"], sum(flat) / len(flat), delta=1e-4)
+                self.assertLessEqual(rec["pooled"], sum(flat) / len(flat) + 1e-4)
+
+    def test_pooled_equals_the_mean_when_every_element_is_the_same(self):
+        for name, rec in load().items():
+            flat = _flatten(rec["per_element"])
+            if max(flat) - min(flat) < 1e-3:
+                with self.subTest(case=name):
+                    self.assertAlmostEqual(rec["pooled"], sum(flat) / len(flat), delta=1e-3)
+
+    def test_it_is_strictly_below_the_mean_on_the_graded_cases(self):
+        """The whole point of the change, visible in the recorded numbers."""
+        for name in ("graded_stereo_2stem", "graded_stereo_4stem", "exact_one_stem"):
+            with self.subTest(case=name):
+                flat = _flatten(self.golden[name]["per_element"])
+                self.assertLess(self.golden[name]["pooled"], sum(flat) / len(flat) - 1.0)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.golden = load()
 
 
 def _flatten(x):

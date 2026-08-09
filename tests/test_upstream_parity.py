@@ -50,10 +50,13 @@ def _as_batch(x):
     return torch.from_numpy(np.atleast_2d(x))
 
 
-def _torch_metric(unprocessed, processed, target, sample_rate=SR):
-    """Run this port on numpy inputs shaped like upstream's, returning the POOLED float."""
-    audio_length = unprocessed.shape[-1] / sample_rate
-    m = make_metric(audio_length=audio_length, sample_rate=sample_rate)
+def _torch_metric(unprocessed, processed, target, sample_rate=SR, p_exponent=None):
+    """Run this port on numpy inputs shaped like upstream's, returning the POOLED float.
+
+    `p_exponent` is spelled out rather than `p` because `processed` is conventionally `p` here.
+    """
+    kw = {} if p_exponent is None else {"p": p_exponent}
+    m = make_metric(sample_rate=sample_rate, **kw)
     u, p, t = _as_batch(unprocessed), _as_batch(processed), _as_batch(target)
     return float(m(u[None], p[None, :, None, :], t[None, :, None, :]))
 
@@ -174,10 +177,10 @@ class TestUnequalChannelsAndStems(unittest.TestCase):
     # A distinct residual level per (channel, stem), spanning 30 dB, so no two elements agree.
     LEVELS = ((0.316, 0.1, 0.0316), (0.0562, 0.0178, 0.01))
 
-    def _case(self, seed=101, stems=3):
+    def _case(self, seed=101, stems=3, levels=None):
         rng = np.random.default_rng(seed)
         u = rng.uniform(-1, 1, (2, SR)).astype(np.float32)
-        levels = np.array([row[:stems] for row in self.LEVELS], dtype=np.float32)
+        levels = np.array([row[:stems] for row in (levels or self.LEVELS)], dtype=np.float32)
         p = (u[:, None, :] * levels[:, :, None]).astype(np.float32)
         t = np.zeros_like(p)
         return u, p, t
@@ -220,18 +223,47 @@ class TestUnequalChannelsAndStems(unittest.TestCase):
         mean_mse = sum(math.exp(v / -4.0) for v in per_channel) / len(per_channel)
         self.assertGreater(abs(pooled - (-4.0 * math.log(mean_mse))), 1.0)
 
-    def test_pooled_value_matches_upstream_for_unequal_channels(self):
-        """True while pooling is mean-of-logs (p = 0).
+    def test_p_zero_still_reproduces_upstream_for_unequal_channels(self):
+        """The compatibility path. `p=0` is mean-of-logs, which is exactly what upstream does.
 
-        EXPECTED TO CHANGE when the default p moves to 1/2: this is the assertion that proves the
-        aggregation rule actually moved, so update it deliberately with the measured delta rather
-        than deleting it.
+        Residual levels are kept above -50 dB here: below that the removed -68 dB inaudibility gate
+        makes upstream and this port diverge for a separate, documented reason, and mixing the two
+        causes would make a failure ambiguous.
         """
-        u, p, t = self._case(stems=1)
-        ref = float(_upstream(u, p[:, 0], t[:, 0], SR))
-        got = _torch_metric(u, p[:, 0], t[:, 0])
-        self.assertAlmostEqual(got, ref, delta=TOL,
-                               msg=f"unequal-channel pooled: {got!r} vs upstream {ref!r}")
+        for levels in (((0.1,), (0.01,)), ((0.316,), (0.0178,))):
+            with self.subTest(levels=levels):
+                u, p, t = self._case(stems=1, levels=levels)
+                ref = float(_upstream(u, p[:, 0], t[:, 0], SR))
+                got = _torch_metric(u, p[:, 0], t[:, 0], p_exponent=0.0)
+                self.assertAlmostEqual(got, ref, delta=TOL,
+                                       msg=f"p=0 unequal-channel pooled: {got!r} vs {ref!r}")
+
+    def test_the_default_deliberately_diverges_for_unequal_channels(self):
+        """The aggregation change, measured rather than asserted, and in the expected direction.
+
+        This test failed the moment the default moved from 0 to 1/2, which is what it is for. It
+        was written before the change with a note to update it deliberately rather than delete it.
+
+        Upstream averages the per-channel LOGS, so one good channel flatters one bad one. The power
+        mean at p=1/2 does not, and the gap grows with the spread - which is the entire point:
+
+            L/R residual   upstream    p=1/2   divergence
+              -20/-40 dB    27.6308  23.2033      -4.43
+              -15/-55 dB    32.2274  19.2732     -12.95
+              -10/-70 dB    37.4442  14.7529     -22.69
+
+        Per-element values are unaffected - see test_per_element_values_match_upstream, which is
+        the fidelity anchor that survives this change.
+        """
+        previous = 0.0
+        for levels, expected in ((((0.1,), (0.01,)), -4.4), (((0.178,), (0.00178,)), -12.9)):
+            with self.subTest(levels=levels):
+                u, p, t = self._case(stems=1, levels=levels)
+                divergence = _torch_metric(u, p[:, 0], t[:, 0]) - float(_upstream(u, p[:, 0], t[:, 0], SR))
+                self.assertAlmostEqual(divergence, expected, delta=0.5,
+                                       msg=f"divergence {divergence:.4f}, expected about {expected}")
+                self.assertLess(divergence, previous, "the gap must grow with the spread")
+                previous = divergence
 
 
 class TestDivergenceIsDeliberate(unittest.TestCase):

@@ -343,6 +343,74 @@ class TestNoSideEffects(unittest.TestCase):
             self.assertEqual(float(m(u, p, t)), first)
 
 
+class TestGradientAllocation(unittest.TestCase):
+    """Why the default p is 1/2: it is where per-stem gradient energy comes out equal.
+
+    Per-stem gradient energy scales as `mse**(2p - 1)`, so it is equal across stems if and only if
+    `p = 1/2`. That is derived, not tuned, and the measurement below is exact rather than
+    approximate - which is the point of pinning it.
+
+    This is the defect the whole redesign exists for. Averaging in the log domain starves the stem
+    that most needs gradient: with four stems spread over 25 dB, the worst gets 0.2% of the
+    gradient energy while the best-converged takes 74%. GitHub issue #5 ("huge gradients when
+    training") is the same effect seen from the other side - as stems converge, the log-domain
+    average keeps amplifying whatever is left.
+    """
+
+    N = 8192
+    LEVELS = (0.316, 0.1, 0.0316, 0.0178)  # -10, -20, -30, -35 dB: a 25 dB spread
+
+    def _shares(self, p):
+        torch.manual_seed(5)
+        u = torch.rand(1, 1, self.N) * 2 - 1
+        t = torch.rand(1, 1, 4, self.N) * 2 - 1
+        levels = torch.tensor(self.LEVELS).reshape(1, 1, 4, 1)
+        estimate = (t + u[:, :, None, :] * levels).detach().requires_grad_(True)
+        _metric(p=p, return_as_loss=True)(u, estimate, t).backward()
+        energy = torch.stack([estimate.grad[:, :, s].pow(2).sum() for s in range(4)])
+        return energy / energy.sum(), float(estimate.grad.norm())
+
+    def test_gradient_energy_is_equal_across_stems_at_the_default(self):
+        shares, _ = self._shares(0.5)
+        for i, share in enumerate(shares):
+            with self.subTest(stem=i, level_db=round(20 * math.log10(self.LEVELS[i]))):
+                self.assertAlmostEqual(float(share), 0.25, places=3,
+                                       msg=f"stem {i} takes {100 * float(share):.1f}% of the "
+                                           "gradient energy, not 25%")
+
+    def test_participation_ratio_reaches_the_stem_count(self):
+        """1/sum(share^2) counts how many stems are effectively being trained. 4.00/4 is ideal."""
+        shares, _ = self._shares(0.5)
+        self.assertAlmostEqual(float(1.0 / shares.pow(2).sum()), 4.0, places=3)
+
+    def test_the_old_default_starves_the_worst_stem(self):
+        """The behaviour being fixed, asserted so the improvement cannot silently regress.
+
+        p=0 is still available for comparability with published figures, and it still allocates
+        gradient the way it always did - which is why it is not the default any more.
+        """
+        shares, _ = self._shares(0.0)
+        self.assertLess(float(shares[0]), 0.01, "p=0 no longer starves the worst stem; if the "
+                                                "pooling changed, this test is the wrong oracle")
+        self.assertLess(float(1.0 / shares.pow(2).sum()), 2.0)
+
+    def test_p_one_concentrates_worse_than_p_zero(self):
+        """Pinning the refutation of the obvious alternative.
+
+        Pooling the MSE arithmetically looks like the natural fix and is worse than doing nothing:
+        it chases the loudest residual even harder than the log-domain mean does. Measured
+        participation ratio 1.23/4 against 1.66/4 for p=0 and 4.00/4 for p=1/2.
+        """
+        one, _ = self._shares(1.0)
+        zero, _ = self._shares(0.0)
+        self.assertLess(float(1.0 / one.pow(2).sum()), float(1.0 / zero.pow(2).sum()))
+
+    def test_the_global_gradient_norm_shrinks_as_pooling_balances(self):
+        """The other half of GH #5: a runaway norm as stems converge."""
+        norms = [self._shares(p)[1] for p in (0.0, 0.5)]
+        self.assertLess(norms[1], norms[0])
+
+
 class TestClassSplit(unittest.TestCase):
     """`LogWMSE` (higher is better) and `LogWMSELoss` (lower is better) replace `return_as_loss`.
 
@@ -446,17 +514,35 @@ class TestReductionSemantics(unittest.TestCase):
         # sum/mean is now the BATCH size. It was batch x channels x stems, i.e. 12 for this case.
         self.assertAlmostEqual(total / mean, b, places=3)
 
-    def test_pooling_is_over_channel_and_stem_only(self):
-        """The identity that makes p=0 exactly the old behaviour, and the batch axis untouched."""
+    def _graded_batch(self):
+        """Per-element quality spread over 30 dB, so pooling rules actually disagree."""
         torch.manual_seed(21)
         b, c, s, n = 3, 2, 4, 4096
-        u = (torch.rand(b, c, n) * 2 - 1)
-        p = (torch.rand(b, c, s, n) * 2 - 1) * 0.1
-        t = torch.zeros_like(p)
-        m = _metric(reduction="none")
+        u = torch.rand(b, c, n) * 2 - 1
+        levels = torch.logspace(math.log10(0.316), math.log10(0.01), c * s).reshape(1, c, s, 1)
+        return u, (u[:, :, None, :] * levels).contiguous(), torch.zeros(b, c, s, n)
+
+    def test_p_zero_pools_as_the_mean_of_the_per_stem_values(self):
+        """The identity that makes p=0 exactly the pre-1.0.0 behaviour, and the batch axis untouched.
+
+        Asserted on a GRADED case: with near-equal elements every pooling rule agrees, so an
+        equal-quality case would pass whatever p was in force and prove nothing.
+        """
+        u, p, t = self._graded_batch()
+        m = _metric(p=0.0, reduction="none")
         self.assertTrue(
             torch.allclose(m(u, p, t), m.per_stem(u, p, t).mean(dim=(1, 2)), atol=1e-5),
-            "at p=0 the pooled value must be the mean of the per-stem values, exactly")
+            "at p=0 the pooled value must be the mean of the per-stem values")
+
+    def test_the_default_p_does_not_pool_as_a_plain_mean(self):
+        """The complement: at p=1/2 the pooled value must DIFFER from the mean of the elements.
+
+        If these agreed, the default would not have changed anything.
+        """
+        u, p, t = self._graded_batch()
+        m = _metric(reduction="none")
+        gap = float((m(u, p, t) - m.per_stem(u, p, t).mean(dim=(1, 2))).abs().min())
+        self.assertGreater(gap, 1.0, "the default pooling is indistinguishable from a plain mean")
 
     def test_per_entry_values_survive_batch_reduction(self):
         # The original suite asserted values only for batch size 1; this pins multi-entry reduction.
