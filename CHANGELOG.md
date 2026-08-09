@@ -110,13 +110,78 @@ Updated README to reflect 0.2.8 `bypass_filter` update.
 - Version now only needs to be updated in one location (`torch_log_wmse/__init__.py`)
 - `setup.cfg` now references version via `attr: torch_log_wmse.__version__`
 - `torch_log_wmse_audio_quality` inherits version through import
-## 0.4.0 (unreleased)
+## 1.0.0 (unreleased)
 
-Outcome of a full adversarial audit of the library against its upstream, `nomonosound/log-wmse-audio-quality`. Every change below is backed by a reproduced measurement; where a previously suspected problem turned out not to be real, that is recorded too, because several of them looked convincing.
+Two things happened here. A full adversarial audit of the library against its upstream, `nomonosound/log-wmse-audio-quality`, and then a redesign that the audit made unavoidable: it found that **the loss starves the stem that most needs gradient**, which no amount of tuning fixes because it is inherent to averaging in the log domain.
 
-### BREAKING
+This is where the `0.x` "anything may change" signal stops being true. The API is deliberate rather than accumulated, and it is a breaking release in almost every direction. Every change below is backed by a reproduced measurement; where a previously suspected problem turned out not to be real, that is recorded too, because several of them looked convincing.
 
-- **Invalid inputs now raise `ValueError` instead of returning a number.** Batch and channel agreement between `unprocessed_audio` and `processed_audio` was never checked, and because the scaling factor broadcasts, a mismatch produced a plausible result rather than an error: a mono mixture against stereo stems returned `18.41251`, a batch-1 mixture against batch-4 stems `18.37790`. Input length is now also checked against the length configured at construction, closing a path where the filtered branch silently scored only the first `audio_length_samples` while `bypass_filter=True` scored everything, so the two disagreed by up to 26 units on identical data.
+### Migrating from 0.x
+
+| Before | Now |
+|---|---|
+| `LogWMSE(audio_length=1.0, sample_rate=44100)` | `LogWMSE(sample_rate=44100)` — one instance serves any length |
+| `LogWMSE(..., return_as_loss=True)` | `LogWMSELoss(...)` |
+| `LogWMSE(..., return_as_loss=False)` | `LogWMSE(...)` — this class is now the metric, higher is better |
+| `LogWMSE(1.0, 44100)` | keyword-only: `LogWMSE(sample_rate=44100)` |
+| `reduction="none"` for per-stem values | `per_stem()` → `[batch, channel, stem]` |
+| `reduction="none"` | still valid, now returns `[batch]` |
+| `from torch_log_wmse_audio_quality import ...` | `from torch_log_wmse import ...` |
+
+Both removed constructor arguments raise `TypeError` naming their replacement rather than being ignored. The constructor is keyword-only specifically because `audio_length` used to come first: a positional call written for 0.x would otherwise put a duration where `sample_rate` now is and quietly build a metric at 1 Hz.
+
+**Values change** for multi-stem and stereo inputs. Single-stem mono results are unaffected by the aggregation change. Pass `p=0` to restore the previous aggregation exactly.
+
+### Why the aggregation changed
+
+The metric averaged the logs of the per-stem errors. That sounds neutral and is not: in the log domain, a stem that is already good contributes as much *movement* per unit of relative improvement as a stem that is terrible, so the gradient flows to wherever the relative error is easiest to shrink. With four stems spread over 25 dB, the worst stem received **0.2%** of the gradient energy and the best-converged took 74%.
+
+The fix is to combine the per-stem errors with a power mean instead, exponent `p`. Per-stem gradient energy scales as `mse^(2p-1)`, which is equal across stems at exactly one value — `p = 1/2`, now the default. It is derived, not tuned.
+
+| `p` | gradient shares, 4 stems over 25 dB | effective stems trained | global gradient norm |
+|---|---|---|---|
+| `0` (pre-1.0.0) | 0.2% / 2.3% / 23.5% / 74.0% | 1.66 of 4 | 3.59 |
+| **`0.5` (new default)** | **25% / 25% / 25% / 25%** | **4.00 of 4** | 0.94 |
+| `1` | 89.8% / 9.0% / 0.9% / 0.3% | 1.23 of 4 | 0.66 |
+
+`p=1` is in that table because pooling the MSE arithmetically is the obvious alternative and is measurably worse than doing nothing.
+
+This also answers issue #5 ("huge gradients when training"), which is the same effect seen from the other side: as stems converge, log-domain averaging keeps amplifying whatever error is left.
+
+> **`p = 1/2` is derived from gradient analysis, not yet validated by a training run.** An A/B against `p = 0` on a real separation model is in progress. If it moves the default, that is a breaking change and a major version bump.
+
+### BREAKING — API
+
+- **`LogWMSE` is the metric and `LogWMSELoss` is the loss.** `return_as_loss` is removed. A flag that silently inverts a training objective is not worth the convenience of one import: forget it when evaluating and your numbers are negated; forget it when training and you minimise quality. `LogWMSELoss` is a real subclass negating at the outermost point, so `loss == -metric` holds for every reduction and for `per_stem` alike.
+- **`audio_length` is removed** and the constructor is keyword-only. The transform size is derived from the input and its weights cached, so one instance serves any length and any stem count. An entire error class goes with it, including the `floor()`-versus-`round()` off-by-one the old length check had to tolerate for callers who sized their segments the ordinary way.
+- **`reduction` covers the batch axis only**, like any other torch loss. `"none"` returns one value per batch item rather than one per `[batch, channel, stem]`, and `"sum"` changes by a factor of channels × stems. Use `per_stem()` for per-element values — and note those are the values that remain comparable with the original numpy implementation at any `p`, so the fidelity anchor is now visible in the API rather than buried in the test suite.
+- **Default `p = 0.5`.** See above.
+- **The `torch_log_wmse_audio_quality` package and distribution are both discontinued.** A shim forwarding a *changed* API is worse than no shim: old code imports cleanly and then behaves differently, which is the failure mode hardest to notice. `import torch_log_wmse_audio_quality` now raises `ImportError`, at the point of the problem. The old distribution stops at 0.3.1 and will not be published again; install `torch-log-wmse` and import `torch_log_wmse`.
+- **The filter no longer follows the input's device.** It is an `nn.Module` holding the impulse response as a non-persistent buffer, so `.to(device)` moves it like anything else and `state_dict()` stays empty — holding one as a submodule adds no checkpoint keys. Previously it reassigned its own tensors mid-forward, which is not thread-safe and is awkward for graph capture.
+- **`calculate_rms` is removed.** It took the square root of a mean square, and at exactly zero `sqrt` has an infinite derivative, so a grad-requiring silent input propagated NaN backwards while the forward value looked finite. The metric now works in the energy domain and never takes a square root, so that failure mode is structurally absent rather than defended against.
+
+### BREAKING — values
+
+- **The -68 dB per-sample inaudibility gate is removed.** It cannot survive computing energy in the frequency domain, because a per-sample gate needs a time-domain signal. Its measured effect across the reachable range was **0.000** — identical values from -10 dB to -40 dB residual — and reaching the band where it mattered needs 74-80 dB SI-SDR. Exact digital silence still returns the ceiling, so the headline feature never depended on it. Scores below roughly -50 dB residual now differ slightly from earlier versions, and the closed-form oracle holds at every level instead of breaking down below 1e-3.
+- **An identical error now scores the same wherever it falls in the buffer.** The metric measures the energy of the full linear convolution rather than of a window the same length as the input, so the filter's ring at the buffer edges is counted instead of discarded. The old behaviour scored a single-sample error **0.77 units better at the buffer boundary than in the middle**, purely because half its ring fell outside the window. Broadband residuals move by under 6e-04; the difference is material only for errors concentrated at the very edges.
+
+### Performance
+
+**2.35× at 0.5 s, 2.64× at 1 s, 3.45× at 2 s, 2.81× at 5 s**, measured end to end on stereo 4-stem audio.
+
+- **The weighted error energy is computed in the frequency domain.** One-sided Parseval gives it from the forward transform alone, so the inverse transform, the group-delay correction and the trim all disappear — along with the class of alignment bug the audit had already found once in the group-delay handling.
+- **Transform sizes are the smallest even 2/3/5-smooth value that fits**, not the next power of two. One second at 44.1 kHz needs 48099 samples: 48600 as a smooth number against 65536 as a power of two, cutting padding waste from 36% to 1%.
+- Fixed-length input is the supported path and produces exactly one cache entry, which is what `torch.compile` wants. Variable-length input is correct but pays a small per-length setup and produces many distinct transform sizes, which defeats compilation caching.
+
+### Added
+
+- **`per_stem()`** returning `[batch, channel, stem]` scores.
+- **`p`** exposed and documented, including `p=0` as the compatibility path.
+- **`py.typed`**, so the type hints are visible to mypy and pyright rather than only to people reading the source.
+
+### BREAKING — from the audit
+
+- **Invalid inputs now raise `ValueError` instead of returning a number.** Batch and channel agreement between `unprocessed_audio` and `processed_audio` was never checked, and because the scaling factor broadcasts, a mismatch produced a plausible result rather than an error: a mono mixture against stereo stems returned `18.41251`, a batch-1 mixture against batch-4 stems `18.37790`. The audit also added a check that the input length matched the length configured at construction, closing a path where the filtered branch silently scored only the first `audio_length_samples` while `bypass_filter=True` scored everything — the two disagreed by up to 26 units on identical data. 1.0.0 removes both the check and the constructor argument it guarded: with the transform size derived from the input, there is nothing left to mismatch.
 - **Validation no longer uses `assert`.** `python -O` strips assertions, so under optimisation a stem-count mismatch returned `0.02163` and a length mismatch `0.40525`.
 - **`reduction` is validated** at construction and in `apply_reduction`, which previously fell through silently: `"Mean"`, `"average"`, `"batchmean"`, `""` and `None` all behaved as `"none"` and returned an unreduced tensor.
 - **A malformed `impulse_response` now raises.** Previously unvalidated, so an all-zero impulse response made the metric report its `+73.6827` "perfect" ceiling for **every input, forever** — a truncated `filter_ir.pkl` would have silently reported flawless quality. A 2-D response was broadcast against the stem axis instead of raising, giving per-stem values wrong by ~0.04 with the same output shape. Upstream gets this guard free from `scipy.signal.oaconvolve`; the move to FFT convolution lost it.
@@ -125,7 +190,7 @@ Outcome of a full adversarial audit of the library against its upstream, `nomono
 - **The bundled filter is no longer a pickle.** `filter_ir.pkl` is replaced by `filter_ir.f32`, raw little-endian float32 with its length and SHA-256 pinned in the loader. `pickle.load` resolves and calls arbitrary dotted global names, and nothing validated the result; the payload is 4000 floats and needs none of that. The bytes are the float32 cast of the original array, which is exactly what the old loader produced, so **metric values are unchanged** (verified bitwise equal). The file also halves, 32151 to 16000 bytes. Upstream's generator is now vendored at `dev/create_freq_weighting_filter_ir.py`, so the filter can be regenerated and compared rather than trusted, and upstream's design credits (Fenton & Lee 2017; mmxgn 2023) are carried over.
 - **numpy is no longer a runtime dependency.** It was never imported by this package; it was required only so the pickle could reconstruct a numpy array. Verified by blocking every numpy import and running a full forward pass.
 - **Dependency floors raised** to `torch>=2.0`, `torchaudio>=2.0`, `python_requires>=3.9`. The old floors could not all hold at once: torchaudio has no 1.x release, so `torchaudio>=1.8.0` already meant `>=2.0.1`, which pins torch `>=2.0` and made the advertised `torch>=1.8.0` unreachable.
-- **`torch-log-wmse-audio-quality` is now a metadata-only distribution.** It ships no code and depends on `torch-log-wmse` at the same version. Both names previously shipped both package directories and both `RECORD` files claimed the same 11 paths, so installing both and uninstalling either deleted the survivor's files while `pip list` still reported it installed and `import torch_log_wmse` raised `ModuleNotFoundError`. Cross-installing also silently overwrote files a hash-pinned distribution owned. `pip install torch-log-wmse-audio-quality` still works and still provides both import names.
+- **The two distributions could destroy each other's files.** Through 0.3.1 both `torch-log-wmse` and `torch-log-wmse-audio-quality` shipped both package directories, and both `RECORD` files claimed the same 11 paths — so installing both and uninstalling either deleted the survivor's files while `pip list` still reported it installed and `import torch_log_wmse` raised `ModuleNotFoundError`. Cross-installing also silently overwrote files a hash-pinned distribution owned. The audit's fix was to make the second distribution metadata-only; 1.0.0 goes further and discontinues it entirely (see above), which makes the collision structurally impossible rather than merely avoided.
 
 ### Fixed
 
@@ -159,7 +224,7 @@ Outcome of a full adversarial audit of the library against its upstream, `nomono
 
 Recorded because each looked like a defect and was not, and re-deriving them would waste effort:
 
-- **The error-tolerance dead zone is not a training hazard.** The zero-gradient region is exactly `argmin(loss)` — every point in it attains `-73.682724`, bit-identical to a perfect estimate, and an optimisation started inside it converges to the global minimum with gap `+0.00e+00`. It is also unreachable by 50-70 dB: it needs roughly 74-80 dB SI-SDR, against 5-25 dB for published separation and enhancement. At attainable error levels the threshold is numerically invisible (gradient cosine similarity 1.000000). Replacing the hard threshold with smooth shrinkage would have changed nothing reachable while breaking bit-parity with upstream.
+- **The error-tolerance dead zone is not a training hazard.** (Moot in 1.0.0, which removes the gate entirely — but the analysis is why removing it was known to be safe.) The zero-gradient region is exactly `argmin(loss)` — every point in it attains `-73.682724`, bit-identical to a perfect estimate, and an optimisation started inside it converges to the global minimum with gap `+0.00e+00`. It is also unreachable by 50-70 dB: it needs roughly 74-80 dB SI-SDR, against 5-25 dB for published separation and enhancement. At attainable error levels the threshold is numerically invisible (gradient cosine similarity 1.000000). Replacing the hard threshold with smooth shrinkage would have changed nothing reachable while breaking bit-parity with upstream.
 - **Gradient magnitude is normal for this class of loss.** `‖∇‖ = 8/(√N · rms(F(p−t)))`; the scaling factor cancels, so mixture level is irrelevant. Growing gradients as the estimate improves, and `1/g` scaling under joint gain, are both shared with SI-SDR (measured within ~30% at every operating point).
-- **Per-stem mean-of-logs does not hide a failed stem.** One failed stem of four costs exactly `ceiling/K` = 18.42 units, the maximum a single stem can inflict, and it receives 100% of the gradient energy because correct stems have zero difference. Mean-over-sources is also upstream's own convention and the audio-ML norm.
+- ~~**Per-stem mean-of-logs does not hide a failed stem.**~~ **This conclusion was wrong, and the way it was wrong is worth recording.** It was measured on one totally failed stem against three *perfect* ones, where it holds exactly: the failed stem costs `ceiling/K` = 18.42 units and takes 100% of the gradient energy, because stems with zero error contribute none. But that case is not what training looks like. With four stems at *different partial* levels of convergence — a 25 dB spread, which is ordinary — the worst stem receives **0.2%** of the gradient energy. The test case was unrepresentative in precisely the way that made the aggregation look sound, and finding that is what turned the audit into this redesign. See "Why the aggregation changed" above.
 - **44.1 kHz parity with the original numpy implementation is exact** — `0.000e+00` across mono, stereo, independent signals, exact match, all-silence, and tone errors from 60 Hz to 7 kHz, with at most one float32 ULP (1.9e-06) at extreme gains. The shipped `frequency_weighting.png` still matches the shipped filter, and the filter is reproducible from upstream's documented recipe to 1.6e-08.
