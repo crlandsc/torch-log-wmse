@@ -693,17 +693,22 @@ class TestImpulseResponseValidation(unittest.TestCase):
 class TestSilenceGradients(unittest.TestCase):
     """A digitally silent, grad-requiring input must not poison the graph.
 
-    calculate_rms takes sqrt of a mean square; at exactly zero sqrt has infinite derivative, so the
-    forward value stayed finite (RMS_EPS is applied afterwards) while the backward pass produced NaN.
+    The original failure: an RMS is the sqrt of a mean square, and at exactly zero sqrt has an
+    infinite derivative, so the forward value stayed finite while the backward pass produced NaN.
     Reachable when the "unprocessed" signal is an upstream module's output in a cascaded system.
+
+    1.0.0 removes the square root rather than guarding it - the metric clamps a MEAN SQUARE at
+    RMS_EPS**2 and never takes a root - so this is now testing that the failure mode is absent by
+    construction. Asserted end to end through the metric, which is the only thing that can regress.
     """
 
-    def test_rms_gradient_at_exact_zero_is_finite(self):
-        from torch_log_wmse.utils import calculate_rms
-        z = torch.zeros(1, 1, 1, 16, requires_grad=True)
-        calculate_rms(z).sum().backward()
-        self.assertTrue(torch.isfinite(z.grad).all())
-        self.assertEqual(float(z.grad.abs().max()), 0.0)
+    def test_gradient_through_a_silent_mixture_is_finite_in_every_dtype(self):
+        for dtype in (torch.float32, torch.float64):
+            with self.subTest(dtype=dtype):
+                z = torch.zeros(1, 1, 4096, dtype=dtype, requires_grad=True)
+                p = torch.randn(1, 1, 1, 4096, dtype=dtype)
+                _metric(return_as_loss=True)(z, p, torch.zeros_like(p)).backward()
+                self.assertTrue(torch.isfinite(z.grad).all())
 
     def test_grad_requiring_silent_mixture_does_not_produce_nan(self):
         n = 4096
@@ -989,31 +994,39 @@ class TestConstructorValidation(unittest.TestCase):
                     self.assertTrue(math.isfinite(float(out)))
 
 
-class TestRmsFloorIsDtypeCorrect(unittest.TestCase):
-    """The sqrt floor must be the dtype's smallest normal, not a hard-coded constant.
+class TestQuietMixturesAreNotRewritten(unittest.TestCase):
+    """The mixture floor must engage only for genuinely degenerate input, not for quiet audio.
 
-    A literal such as 1e-24 underflows to 0.0 in float16, making the guard a silent no-op there, and
-    it would also rewrite any legitimate mean-square below it -- float32 represents mean-squares down
-    to about 1e-38, so a fixed 1e-24 altered roughly seven decades of genuinely quiet audio.
+    This used to be about a hard-coded floor inside an RMS helper: a literal such as 1e-24
+    underflows to 0.0 in float16, making the guard a silent no-op there, and it also rewrote any
+    legitimate mean square below it - float32 holds mean squares down to about 1e-38, so a fixed
+    1e-24 altered roughly seven decades of genuinely quiet audio.
+
+    The helper is gone in 1.0.0, so the property is asserted where it now lives: RMS_EPS**2 is a
+    floor on the MIXTURE's mean square, and a mixture above it must scale exactly as its own level
+    dictates. Scale invariance is the observable form of that.
     """
 
-    def test_gradient_at_zero_is_finite_in_every_float_dtype(self):
-        from torch_log_wmse.utils import calculate_rms
-        for dtype in (torch.float32, torch.float64, torch.bfloat16):
-            with self.subTest(dtype=dtype):
-                z = torch.zeros(1, 1, 1, 16, dtype=dtype, requires_grad=True)
-                calculate_rms(z).sum().backward()
-                self.assertTrue(torch.isfinite(z.grad).all())
-                self.assertEqual(float(z.grad.abs().max()), 0.0)
+    def test_scale_invariance_holds_for_very_quiet_mixtures(self):
+        # RMS_EPS is 1e-8, so a mixture at 1e-6 is a hundred times above the floor: quiet, but not
+        # degenerate, and its score must match the same material at unit level.
+        torch.manual_seed(60)
+        u = torch.rand(1, 1, 4096) * 2 - 1
+        p = (torch.rand(1, 1, 1, 4096) * 2 - 1) * 0.1
+        reference = float(_metric()(u, p, torch.zeros_like(p)))
+        for amplitude in (1e-2, 1e-4, 1e-6):
+            with self.subTest(amplitude=amplitude):
+                got = float(_metric()(u * amplitude, p * amplitude, torch.zeros_like(p)))
+                self.assertAlmostEqual(got, reference, places=2)
 
-    def test_quiet_but_normal_amplitudes_are_preserved(self):
-        from torch_log_wmse.utils import calculate_rms
-        # 1e-13 is about -260 dBFS: absurdly quiet, but its mean-square is still a normal float32,
-        # so it must pass through untouched. The old 1e-24 floor clamped it to 1e-12.
-        for amp in (1e-6, 1e-10, 1e-13):
-            with self.subTest(amp=amp):
-                got = float(calculate_rms(torch.full((1, 1, 1, 64), amp)))
-                self.assertAlmostEqual(got / amp, 1.0, places=3)
+    def test_the_floor_engages_only_below_rms_eps(self):
+        """Below the floor, scale invariance is expected to STOP holding - that is what a floor is."""
+        torch.manual_seed(61)
+        u = torch.rand(1, 1, 4096) * 2 - 1
+        p = (torch.rand(1, 1, 1, 4096) * 2 - 1) * 0.1
+        reference = float(_metric()(u, p, torch.zeros_like(p)))
+        got = float(_metric()(u * 1e-10, p * 1e-10, torch.zeros_like(p)))
+        self.assertGreater(abs(got - reference), 1.0)
 
 
 class TestModuleContract(unittest.TestCase):
@@ -1223,6 +1236,23 @@ class TestTransformSizing(unittest.TestCase):
         self.assertTrue(torch.equal(reused, fresh),
                         "a float64 call after a float32 call did not match a fresh instance")
         self.assertEqual(len(shared._weights), 2)
+
+    def test_the_weights_themselves_are_built_in_the_input_dtype(self):
+        """Not just the cache KEY - the weight values.
+
+        Building them from the float32 impulse response and letting promotion carry them into a
+        float64 computation gives a float64 RESULT holding only float32 precision. Nothing
+        observable changes by more than about 1e-8 relative, which is under the noise floor of every
+        behavioural case here, so the property has to be asserted directly. This gap was found by a
+        surviving mutant, not by a failing test.
+        """
+        f = make_filter()
+        for dtype in (torch.float32, torch.float64):
+            with self.subTest(dtype=dtype):
+                f(torch.rand(1, 1, 1, 1024, dtype=dtype))
+                weights = f.weights_for(1024, dtype)
+                self.assertEqual(weights.dtype, dtype,
+                                 f"weights for a {dtype} input were built as {weights.dtype}")
 
     def test_the_cache_is_capped(self):
         f = make_filter(cache_size=3)
@@ -1489,14 +1519,25 @@ class TestLowPrecisionDtypes(unittest.TestCase):
 
     def test_backward_is_finite_through_a_bit_exact_stem(self):
         """Forward-only checks miss this class entirely: the value can be finite while the gradient
-        is not. Kept here because the same trap reappears when pooling gains a fractional power."""
-        for dtype in self.HALF_DTYPES:
-            with self.subTest(dtype=dtype):
-                m = _metric(audio_length=1024 / SR, bypass_filter=True)
-                u, p, t = self._triplet(dtype)
-                p = p.detach().requires_grad_(True)
-                m(u, p, t).backward()
-                self.assertTrue(torch.isfinite(p.grad).all(), f"{dtype} grad: {p.grad}")
+        is not.
+
+        The trap did reappear when pooling gained a fractional power, exactly as this test was
+        written to anticipate. At p = 1/2 the derivative of sqrt is infinite at zero, so putting EPS
+        outside the pool gives `grad = [nan, ...]` on a stem matched bit-for-bit - which is the
+        digital-silence case the package exists for - while the forward value stays finite.
+
+        float32 and float64 are swept alongside the half dtypes: nothing about that failure is
+        low-precision-specific, and the original version of this test only covered the half dtypes
+        because they were what motivated it.
+        """
+        for dtype in self.HALF_DTYPES + (torch.float32, torch.float64):
+            for p_exponent in (0.0, 0.5, 1.0):
+                with self.subTest(dtype=dtype, p=p_exponent):
+                    m = _metric(bypass_filter=True, p=p_exponent)
+                    u, p, t = self._triplet(dtype)
+                    p = p.detach().requires_grad_(True)
+                    m(u, p, t).backward()
+                    self.assertTrue(torch.isfinite(p.grad).all(), f"{dtype} p={p_exponent}: {p.grad}")
 
 
 if __name__ == "__main__":

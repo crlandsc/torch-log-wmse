@@ -9,22 +9,16 @@ README and CHANGELOG.
 import torch
 from typing import Union
 
-def calculate_rms(samples: torch.Tensor):
-    """
-    Calculates the Root Mean Square (RMS) power level of a tensor of audio samples.
-        Args: samples (torch.Tensor): A tensor containing audio samples, with time samples in the last dimension.
-        Returns: torch.Tensor: A tensor with the last dimension (time) reduced, containing the RMS power level of the audio samples.
-    """
-    # clamp_min, not `+ eps`: at exactly zero `sqrt` has infinite derivative, so a grad-requiring
-    # all-silent input propagates NaN backwards while the forward value still looks finite.
-    #
-    # The floor is the dtype's smallest normal rather than a hard-coded constant. A literal like
-    # 1e-24 underflows to 0.0 in float16, making the guard a silent no-op there, and it would also
-    # rewrite any legitimate mean-square below it -- float32 represents mean-squares down to ~1e-38,
-    # so a fixed 1e-24 would alter about seven decades of genuinely quiet audio. finfo().tiny clamps
-    # only subnormals, so every normal value is untouched in every dtype.
-    mean_square = torch.mean(torch.square(samples), dim=-1)
-    return torch.sqrt(torch.clamp_min(mean_square, torch.finfo(mean_square.dtype).tiny))
+# calculate_rms was removed in 1.0.0. It took the square root of a mean square, and at exactly zero
+# `sqrt` has an infinite derivative - so a grad-requiring silent input propagated NaN backwards while
+# the forward value still looked finite. Guarding that needed a floor of the dtype's smallest normal,
+# chosen carefully enough to clamp subnormals without rewriting genuinely quiet audio.
+#
+# None of that is needed now. The metric works in the ENERGY domain and never takes a square root, so
+# it clamps a mean square directly at RMS_EPS**2. The failure mode is not defended against, it is
+# structurally absent - which is why the function goes rather than staying as an unused helper whose
+# careful floor logic exists for a code path that no longer does.
+
 
 def convert_decibels_to_amplitude_ratio(decibels: Union[torch.Tensor, float]):
     """

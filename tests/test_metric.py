@@ -15,24 +15,11 @@ import torch
 # conftest owns the sys.path insertion, the thread cap, and every construction of the metric and the
 # filter. Constructing through it is what keeps the 1.0.0 constructor changes to one edit.
 from tests.conftest import CEILING, make_filter, make_loss, make_metric
-from torch_log_wmse.utils import calculate_rms, convert_decibels_to_amplitude_ratio
+from torch_log_wmse.utils import convert_decibels_to_amplitude_ratio
 
 class TestLogWMSELoss(unittest.TestCase):
     def setUp(self):
         pass # Anything shared between tests
-
-    def test_calculate_rms(self):
-        print("Test calculate_rms")
-        for i in range(10):
-            with self.subTest(i=i):
-                torch.manual_seed(i)
-                samples = torch.rand(2, 2, 44100)
-                rms = calculate_rms(samples)
-
-                self.assertIsInstance(rms, torch.Tensor)
-                self.assertEqual(rms.shape, (2, 2))
-
-                print(f"Test {i}, RMS Value: {rms.mean()}")
 
     def test_per_stem(self):
         """Replaces a test that reached into a private static with a hand-built input_rms.
