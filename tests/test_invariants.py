@@ -705,6 +705,89 @@ class TestRmsFloorIsDtypeCorrect(unittest.TestCase):
                 self.assertAlmostEqual(got / amp, 1.0, places=3)
 
 
+class TestGradientAccumulationEquivalence(unittest.TestCase):
+    """Two micro-batches must give the same gradient as one full batch.
+
+    This is the empirical reason the batch axis stays a conventional mean while channel and stem
+    move to a power mean. Batch items are independent samples, so averaging their losses is what
+    makes the objective an expectation over the data. Pooling batch non-linearly would COUPLE
+    examples, and the first thing that breaks is this identity - which is also what makes DDP
+    equivalent to a single large batch.
+
+    It holds exactly today (measured 0.000e+00), so it is assertable rather than approximate, and it
+    is the test that kills a mutant which pools the batch axis along with the others.
+    """
+
+    def _grad(self, m, u, p, t, scale=1.0):
+        pe = p.detach().clone().requires_grad_(True)
+        (m(u, pe, t) * scale).backward()
+        return pe.grad
+
+    def test_two_micro_batches_equal_one_full_batch(self):
+        n = 2048
+        torch.manual_seed(31)
+        u = torch.rand(4, 2, n) * 2 - 1
+        t = torch.rand(4, 2, 3, n) * 2 - 1
+        p = t + (torch.rand(4, 2, 3, n) * 2 - 1) * 0.1
+        m = _metric(audio_length=n / SR)
+
+        full = self._grad(m, u, p, t)
+        # Each half carries half the weight, which is exactly what an accumulation loop does.
+        first = self._grad(m, u[:2], p[:2], t[:2], scale=0.5)
+        second = self._grad(m, u[2:], p[2:], t[2:], scale=0.5)
+        accumulated = torch.cat([first, second], dim=0)
+
+        self.assertTrue(torch.isfinite(full).all())
+        # torch.equal, not a tolerance: measured bit-identical today (max abs divergence 0.000e+00),
+        # so anything else is a real change rather than float noise.
+        self.assertTrue(
+            torch.equal(full, accumulated),
+            f"accumulation diverged by {float((full - accumulated).abs().max()):.3e}; the batch axis "
+            "is no longer a plain mean, which also breaks DDP equivalence")
+
+    def test_batch_items_do_not_influence_each_other(self):
+        """The same statement from the forward side: one item's value cannot depend on its neighbours."""
+        n = 2048
+        torch.manual_seed(32)
+        u = torch.rand(3, 1, n) * 2 - 1
+        t = torch.rand(3, 1, 2, n) * 2 - 1
+        p = t + (torch.rand(3, 1, 2, n) * 2 - 1) * 0.1
+        m = _metric(audio_length=n / SR, reduction="none")
+
+        together = m(u, p, t)
+        for i in range(3):
+            with self.subTest(item=i):
+                alone = m(u[i : i + 1], p[i : i + 1], t[i : i + 1])
+                self.assertTrue(torch.equal(together[i : i + 1], alone),
+                                f"batch item {i} changed value depending on its neighbours")
+
+
+@unittest.skipUnless(
+    os.environ.get("CI") or os.environ.get("TLW_TEST_COMPILE"),
+    "torch.compile takes ~8s and spawns compile workers; on by default in CI, opt in locally with "
+    "TLW_TEST_COMPILE=1")
+class TestTorchCompile(unittest.TestCase):
+    """A compiled forward must agree with eager and must not graph-break on the per-size lookup.
+
+    Fixed-length input is the supported case and is what this pins. Variable length is documented as
+    causing recompilation: transform sizes sit 1-2% apart once they are 5-smooth rather than powers
+    of two, so a variable-length workload blows past inductor's default cache_size_limit of 8.
+
+    Inductor warns that it cannot generate code for complex operators, so the FFT stays in eager.
+    That is expected and is why the tolerance here is float32 noise rather than zero.
+    """
+
+    def test_compiled_matches_eager(self):
+        n = 2048
+        torch.manual_seed(1)
+        u, p, t = torch.rand(1, 1, n), torch.rand(1, 1, 2, n), torch.rand(1, 1, 2, n)
+        m = _metric(audio_length=n / SR)
+        eager = float(m(u, p, t))
+        compiled = float(torch.compile(m)(u, p, t))
+        self.assertAlmostEqual(compiled, eager, delta=1e-5,
+                               msg=f"compiled {compiled} vs eager {eager}")
+
+
 class TestLowPrecisionDtypes(unittest.TestCase):
     """float16 and bfloat16 must return a finite number, and the SAME ceiling as float32.
 
