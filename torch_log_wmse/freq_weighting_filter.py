@@ -63,7 +63,7 @@ def prepare_impulse_response_fft(impulse_response, fft_size):
     Prepares the FFT of the impulse response for convolution.
 
     The impulse response is centre-padded, which pairs with the group-delay compensation in
-    HumanHearingSensitivityFilter.__call__ to make the filter zero-phase.
+    HumanHearingSensitivityFilter.forward to make the filter zero-phase.
 
     Args:
     - impulse_response: The impulse response signal, a 1D tensor of shape [kernel_size].
@@ -116,17 +116,28 @@ def fft_convolve(audio_batch, impulse_response_fft, fft_size):
     return convolved_audio
 
 
-class HumanHearingSensitivityFilter:
+class HumanHearingSensitivityFilter(torch.nn.Module):
     """
     A filter that applies human hearing sensitivity weighting to audio signals.
 
     This class implements a frequency weighting filter that mimics human hearing sensitivity.
     It uses predefined finite impulse responses (FIR) to simulate how human ears perceive different frequencies.
 
+    An nn.Module rather than a plain class, so it honours the standard torch contract: `.to(device)`
+    and `.cuda()` move its tensors. As a plain class they were unreachable by `.to()`, and `__call__`
+    compensated by comparing devices and REASSIGNING module state mid-forward - not thread-safe, and
+    awkward for torch.compile and graph capture. That compensation is gone; the buffers move.
+
+    Both tensors are registered `persistent=False`. They are derived constants, regenerable from the
+    shipped `filter_ir.f32`, so they must not enter `state_dict()`: any model holding a LogWMSE as a
+    submodule would otherwise gain checkpoint keys and break `load_state_dict(strict=True)` for
+    everyone who saved before, and couple saved models to the package's filter data.
+
     Attributes:
         sample_rate (int): The sample rate of the audio signal.
-        impulse_response (torch.Tensor): The FIR used for filtering.
-        impulse_response_fft (torch.Tensor): The FFT of the impulse response used for efficient convolution.
+        impulse_response (torch.Tensor): The FIR used for filtering. Non-persistent buffer.
+        impulse_response_fft (torch.Tensor): The FFT of the impulse response used for efficient
+            convolution. Non-persistent buffer.
         fft_size (int): The size of the FFT used for convolution. Signals will be padded to this size.
         audio_length_samples (int): The length of the audio signal in samples.
 
@@ -143,6 +154,7 @@ class HumanHearingSensitivityFilter:
             impulse_response: Optional[torch.Tensor] = None,
             impulse_response_sample_rate: int = 44100,
         ):
+        super().__init__()
         # Validate the rates first: Resample() below would otherwise fail with a less useful error,
         # and math.log2 further down raises a bare "math domain error" for a non-positive length.
         if sample_rate <= 0:
@@ -181,7 +193,8 @@ class HumanHearingSensitivityFilter:
             raise ValueError(
                 "impulse_response is all zeros, which would make every comparison report a perfect score."
             )
-        self.impulse_response = impulse_response
+        # persistent=False: a derived constant, not learned state. See the class docstring.
+        self.register_buffer("impulse_response", impulse_response, persistent=False)
 
         # Calculate minimum FFT size (N+M-1) - make a power of 2 for FFT efficiency
         self.audio_length_samples = math.floor(audio_length * sample_rate)
@@ -197,10 +210,13 @@ class HumanHearingSensitivityFilter:
         # Compute the FFT of the impulse response (will be padded to fft_size before FFT).
         # Note this uses the squeezed, validated IR - passing the raw argument here would reintroduce
         # the rank mismatch the validation above exists to prevent.
-        self.impulse_response_fft = prepare_impulse_response_fft(self.impulse_response, self.fft_size)
+        self.register_buffer(
+            "impulse_response_fft",
+            prepare_impulse_response_fft(self.impulse_response, self.fft_size),
+            persistent=False,
+        )
 
-
-    def __call__(self, audio: Tensor) -> Tensor:
+    def forward(self, audio: Tensor) -> Tensor:
         """
         Applies the human hearing sensitivity filter to the input audio via frequency domain convolution.
 
@@ -220,9 +236,10 @@ class HumanHearingSensitivityFilter:
         if audio.ndim != 4:
             raise ValueError("Audio input must have dimensions [batch, channel, stem, time].")
 
-        # Move impulse response to audio device if necessary
-        if self.impulse_response_fft.device != audio.device:
-            self.impulse_response_fft = self.impulse_response_fft.to(audio.device)
+        # No device reassignment here. The buffers follow `.to(device)` like any other module's, so
+        # mutating module state during a forward pass is neither needed nor wanted. A device
+        # mismatch now raises torch's standard "Expected all tensors to be on the same device"
+        # instead of being silently papered over.
 
         # Pad audio to match padded FFT size (N+M-1)
         padding = self.fft_size - audio.shape[-1]

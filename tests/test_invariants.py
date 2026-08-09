@@ -705,6 +705,83 @@ class TestRmsFloorIsDtypeCorrect(unittest.TestCase):
                 self.assertAlmostEqual(got / amp, 1.0, places=3)
 
 
+class TestModuleContract(unittest.TestCase):
+    """The metric must behave like any other nn.Module: `.to()` moves it, and it carries no state.
+
+    The filter used to be a plain class, so `.to(device)` could not reach its tensors and `forward`
+    compensated by comparing devices and reassigning module state mid-pass. Both halves of that are
+    now gone, and these tests are what keep them gone.
+    """
+
+    N = 1024
+
+    def _triplet(self, device="cpu"):
+        # Generated on the CPU and MOVED, never generated on the target device: torch.rand seeds a
+        # separate generator per device, so `torch.rand(..., device="mps")` after manual_seed gives
+        # different numbers to the CPU call. Comparing those would compare different inputs and
+        # report a ~0.5-unit "divergence" that is entirely the test's own doing.
+        torch.manual_seed(71)
+        out = (torch.rand(1, 1, self.N), torch.rand(1, 1, 2, self.N), torch.rand(1, 1, 2, self.N))
+        return tuple(x.to(device) for x in out)
+
+    def test_state_dict_is_empty(self):
+        """Non-persistent buffers, so a model holding this as a submodule gains no checkpoint keys.
+
+        If they became persistent, every downstream `load_state_dict(strict=True)` against a
+        checkpoint saved before the change would fail on unexpected keys.
+        """
+        self.assertEqual(dict(_metric(audio_length=self.N / SR).state_dict()), {})
+
+    def test_strict_load_round_trips_for_a_model_holding_the_metric(self):
+        """The failure the previous test exists to prevent, exercised end to end."""
+        class Model(torch.nn.Module):
+            def __init__(self, n):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(3))
+                self.loss = _metric(audio_length=n / SR)
+
+        a, b = Model(self.N), Model(self.N)
+        self.assertEqual(list(a.state_dict()), ["weight"])
+        b.load_state_dict(a.state_dict(), strict=True)  # must not raise
+
+    def test_to_moves_the_impulse_response_without_a_forward_pass(self):
+        """`.to()` alone must relocate the buffers - no call needed to trigger it.
+
+        The meta device is used because it is available everywhere, so this holds even where no
+        accelerator exists. MPS covers the real thing below.
+        """
+        m = _metric(audio_length=self.N / SR)
+        self.assertEqual(m.filters.impulse_response.device.type, "cpu")
+        moved = m.to("meta")
+        self.assertEqual(moved.filters.impulse_response.device.type, "meta")
+        self.assertEqual(moved.filters.impulse_response_fft.device.type, "meta")
+
+    def test_forward_does_not_mutate_module_state(self):
+        """No device reassignment, and nothing else rebound during the pass.
+
+        Mutating module state in forward is not thread-safe and is awkward for torch.compile and
+        graph capture, which is why the old compensation had to go rather than merely be tidied.
+        """
+        m = _metric(audio_length=self.N / SR)
+        before = (m.filters.impulse_response.data_ptr(), m.filters.impulse_response_fft.data_ptr())
+        m(*self._triplet())
+        after = (m.filters.impulse_response.data_ptr(), m.filters.impulse_response_fft.data_ptr())
+        self.assertEqual(before, after, "forward rebound a buffer")
+
+    @unittest.skipUnless(torch.backends.mps.is_available(), "no MPS device")
+    def test_mps_matches_cpu(self):
+        """A real non-CPU device: movement, execution, and agreement.
+
+        MPS is the only accelerator available here - there is no CUDA device - so it is what stands
+        in for "works off the CPU". It cannot cover float64 or half-precision FFT, and those limits
+        are stated where they apply rather than assumed away.
+        """
+        m = _metric(audio_length=self.N / SR)
+        cpu = float(m(*self._triplet()))
+        gpu = float(m.to("mps")(*self._triplet("mps")))
+        self.assertAlmostEqual(gpu, cpu, delta=1e-4, msg=f"mps {gpu} vs cpu {cpu}")
+
+
 class TestAggregationContract(unittest.TestCase):
     """The four properties that make the pooled number MEAN something, stated without reference to
     how pooling is implemented.

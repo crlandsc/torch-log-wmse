@@ -15,6 +15,89 @@ from torch_log_wmse.freq_weighting_filter import HumanHearingSensitivityFilter
 from torch_log_wmse.utils import VALID_REDUCTIONS, apply_reduction, calculate_rms
 
 
+def per_element_mse(
+    input_rms: Tensor,
+    filters: Callable,
+    processed_audio: Tensor,
+    target_audio: Tensor,
+    bypass_filter: bool = False,
+) -> Tensor:
+    """The frequency-weighted mean squared error, per [batch, channel, stem].
+
+    This is the quantity everything downstream is a function of, and it is deliberately separate
+    from the log: the two halves change independently. The filtering rewrite replaces how this is
+    computed while leaving the score unchanged, and the pooling change replaces how these values
+    combine while leaving this untouched.
+
+    Args:
+        input_rms (Tensor): RMS of the (filtered) mixture. Shape [batch, channel, stem].
+        filters (Callable): The frequency-weighting filter.
+        processed_audio (Tensor): [batch, channel, stem, time].
+        target_audio (Tensor): [batch, channel, stem, time].
+        bypass_filter (bool): Skip the frequency weighting.
+
+    Returns:
+        Tensor: [batch, channel, stem].
+    """
+    # Calculate the scaling factor based on the input RMS. RMS_EPS is a FLOOR rather than an
+    # addend: clamping leaves the scaling factor exactly 1/input_rms for every non-degenerate
+    # input, so joint-gain scale invariance holds exactly, whereas adding RMS_EPS biases very
+    # quiet mixtures. Both forms give an identical value for a digitally silent mixture.
+    scaling_factor = 1 / torch.clamp_min(input_rms, RMS_EPS)
+
+    # Add extra dimension(s) to scaling_factor to match the shape of processed_audio and target_audio
+    while scaling_factor.dim() < processed_audio.dim():
+        scaling_factor = scaling_factor.unsqueeze(-1)
+
+    # Calculate the frequency-weighted differences, ignoring small imperceptible differences.
+    # The filter is linear, so filters(a) - filters(b) == filters(a - b); taking the difference first
+    # halves the filtered signals and so removes one rfft/irfft pair per call.
+    # Skip frequency weighting if bypass_filter is True.
+    differences = (processed_audio - target_audio) * scaling_factor
+    if not bypass_filter:
+        differences = filters(differences)
+
+    # Discard differences too small to be audible. torch.where rather than an in-place masked
+    # assignment: it avoids a data-dependent scatter, which keeps the graph friendly to
+    # torch.compile. Note it does NOT save memory - both forms build the full-size boolean
+    # condition, and where() additionally allocates a new output buffer.
+    differences = torch.where(
+        torch.abs(differences) < ERROR_TOLERANCE_THRESHOLD,
+        torch.zeros((), dtype=differences.dtype, device=differences.device),
+        differences,
+    )
+
+    return (differences**2).mean(dim=-1)
+
+
+def score_from_mse(mse: Tensor) -> Tensor:
+    """Turn per-element MSE into per-element scores: SCALER * log(mse + EPS).
+
+    Separate from `per_element_mse` because this is the half the aggregation change rewrites, and
+    keeping the log out of the MSE computation is what lets pooling happen between the two.
+
+    Args:
+        mse (Tensor): Per-[batch, channel, stem] mean squared error.
+
+    Returns:
+        Tensor: Per-[batch, channel, stem] scores, higher is better.
+    """
+    # Take the log in at least float32, whatever the input dtype was. EPS = 1e-8 underflows to
+    # exactly 0.0 in float16 (the smallest subnormal is 5.96e-8), so a bit-exact stem used to
+    # give log(0) = -inf and the metric returned +inf - and "mean" then propagated that inf
+    # across the whole batch. bfloat16 does not underflow but carries 8 mantissa bits, which is
+    # not enough to hold mse + EPS apart from mse.
+    #
+    # Upcasting rather than using a per-dtype floor is a deliberate choice: it keeps the ceiling
+    # at SCALER*log(EPS) = +73.6827 in EVERY dtype. A floor of finfo(float16).tiny would move
+    # the fp16 ceiling to +38.8 and silently make fp16 and float32 runs incomparable, which is
+    # a worse failure than the one being fixed because it looks like a valid number.
+    if mse.dtype not in (torch.float32, torch.float64):
+        mse = mse.to(torch.float32)
+
+    return torch.log(mse + EPS) * SCALER
+
+
 class LogWMSE(torch.nn.Module):
     """
     logWMSE is a custom metric and loss function for audio signals that calculates the logarithm
@@ -160,49 +243,6 @@ class LogWMSE(torch.nn.Module):
         Returns:
             Tensor: The logWMSE between the processed audio and target audio.
         """
-
-        # Calculate the scaling factor based on the input RMS. RMS_EPS is a FLOOR rather than an
-        # addend: clamping leaves the scaling factor exactly 1/input_rms for every non-degenerate
-        # input, so joint-gain scale invariance holds exactly, whereas adding RMS_EPS biases very
-        # quiet mixtures. Both forms give an identical value for a digitally silent mixture.
-        scaling_factor = 1 / torch.clamp_min(input_rms, RMS_EPS)
-
-        # Add extra dimension(s) to scaling_factor to match the shape of processed_audio and target_audio
-        while scaling_factor.dim() < processed_audio.dim():
-            scaling_factor = scaling_factor.unsqueeze(-1)
-
-        # Calculate the frequency-weighted differences, ignoring small imperceptible differences.
-        # The filter is linear, so filters(a) - filters(b) == filters(a - b); taking the difference first
-        # halves the filtered signals and so removes one rfft/irfft pair per call.
-        # Skip frequency weighting if bypass_filter is True.
-        differences = (processed_audio - target_audio) * scaling_factor
-        if not bypass_filter:
-            differences = filters(differences)
-
-        # Discard differences too small to be audible. torch.where rather than an in-place masked
-        # assignment: it avoids a data-dependent scatter, which keeps the graph friendly to
-        # torch.compile. Note it does NOT save memory - both forms build the full-size boolean
-        # condition, and where() additionally allocates a new output buffer.
-        differences = torch.where(
-            torch.abs(differences) < ERROR_TOLERANCE_THRESHOLD,
-            torch.zeros((), dtype=differences.dtype, device=differences.device),
-            differences,
+        return score_from_mse(
+            per_element_mse(input_rms, filters, processed_audio, target_audio, bypass_filter)
         )
-
-        # Calculate the mean squared differences
-        mean_diff = (differences**2).mean(dim=-1)
-
-        # Take the log in at least float32, whatever the input dtype was. EPS = 1e-8 underflows to
-        # exactly 0.0 in float16 (the smallest subnormal is 5.96e-8), so a bit-exact stem used to
-        # give log(0) = -inf and the metric returned +inf - and "mean" then propagated that inf
-        # across the whole batch. bfloat16 does not underflow but carries 8 mantissa bits, which is
-        # not enough to hold mse + EPS apart from mse.
-        #
-        # Upcasting rather than using a per-dtype floor is a deliberate choice: it keeps the ceiling
-        # at SCALER*log(EPS) = +73.6827 in EVERY dtype. A floor of finfo(float16).tiny would move
-        # the fp16 ceiling to +38.8 and silently make fp16 and float32 runs incomparable, which is
-        # a worse failure than the one being fixed because it looks like a valid number.
-        if mean_diff.dtype not in (torch.float32, torch.float64):
-            mean_diff = mean_diff.to(torch.float32)
-
-        return torch.log(mean_diff + EPS) * SCALER
