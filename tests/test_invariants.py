@@ -27,7 +27,7 @@ import unittest
 # conftest owns the sys.path insertion, the thread cap, SR/CEILING, and every construction of the
 # metric and the filter. Constructing through it is what keeps the 1.0.0 constructor changes to one
 # edit rather than forty.
-from tests.conftest import CEILING, SR, make_filter, make_metric
+from tests.conftest import CEILING, SR, make_filter, make_metric, per_element
 from torch_log_wmse.constants import EPS, ERROR_TOLERANCE_THRESHOLD, SCALER
 
 # Module-local alias, so the call sites below stay as they are.
@@ -703,6 +703,106 @@ class TestRmsFloorIsDtypeCorrect(unittest.TestCase):
             with self.subTest(amp=amp):
                 got = float(calculate_rms(torch.full((1, 1, 1, 64), amp)))
                 self.assertAlmostEqual(got / amp, 1.0, places=3)
+
+
+class TestAggregationContract(unittest.TestCase):
+    """The four properties that make the pooled number MEAN something, stated without reference to
+    how pooling is implemented.
+
+    These are the contract for the aggregation change. Every one of them holds under mean-of-logs
+    and under a power mean at any p, which is the point: if the redesign breaks one, the design is
+    wrong and not the test, and the right response is to stop rather than relax the assertion.
+
+    Levels are kept well clear of the -68 dB inaudibility gate, or "improving a stem" would
+    saturate against the gate rather than the metric and monotonicity would be testing the wrong
+    thing.
+    """
+
+    N = 2048
+    # Both filter paths, and both float dtypes the filter supports. float16 cannot reach the
+    # filtering path at all (no half FFT kernel on CPU or MPS) and is covered separately.
+    VARIANTS = [(dt, bp) for dt in (torch.float32, torch.float64) for bp in (False, True)]
+
+    def _graded(self, levels, dtype=torch.float32, seed=41):
+        """levels[c][s] = that element's residual amplitude, relative to the mixture."""
+        c, s = len(levels), len(levels[0])
+        torch.manual_seed(seed)
+        u = (torch.rand(1, c, self.N) * 2 - 1).to(dtype)
+        t = (torch.rand(1, c, s, self.N) * 2 - 1).to(dtype)
+        lv = torch.tensor(levels, dtype=dtype).reshape(1, c, s, 1)
+        return u, t + u[:, :, None, :] * lv, t
+
+    def test_bracketing(self):
+        """The aggregate always lies between the best and worst per-element score.
+
+        This is what licenses reading the pooled number as an average rather than an arbitrary
+        function of the parts, and it is the property most at risk from a pooling change.
+        """
+        levels = [[0.316, 0.05, 0.01], [0.1, 0.02, 0.003]]
+        for dtype, bypass in self.VARIANTS:
+            with self.subTest(dtype=dtype, bypass_filter=bypass):
+                u, p, t = self._graded(levels, dtype)
+                kw = dict(audio_length=self.N / SR, bypass_filter=bypass)
+                elements = per_element(u, p, t, **kw).flatten()
+                pooled = float(_metric(**kw)(u, p, t))
+                # Guards the guard: bracketing is trivially true when the elements are equal, so a
+                # collapsed spread would leave this asserting nothing. Measured 37.25 units here.
+                self.assertGreater(float(elements.max() - elements.min()), 20.0,
+                                   "per-element spread collapsed; bracketing is now vacuous")
+                self.assertGreaterEqual(pooled, float(elements.min()) - 1e-4,
+                                        f"pooled {pooled} is below the worst element")
+                self.assertLessEqual(pooled, float(elements.max()) + 1e-4,
+                                     f"pooled {pooled} is above the best element")
+
+    def test_monotonicity(self):
+        """Improving any single element never worsens the aggregate."""
+        base = [[0.2, 0.05], [0.1, 0.02]]
+        for dtype, bypass in self.VARIANTS:
+            kw = dict(audio_length=self.N / SR, bypass_filter=bypass)
+            before = float(_metric(**kw)(*self._graded(base, dtype)))
+            for c in range(2):
+                for s in range(2):
+                    with self.subTest(dtype=dtype, bypass_filter=bypass, element=(c, s)):
+                        better = [row[:] for row in base]
+                        better[c][s] *= 0.5  # halve one element's residual, leave the rest
+                        after = float(_metric(**kw)(*self._graded(better, dtype)))
+                        self.assertGreaterEqual(
+                            after, before - 1e-4,
+                            f"improving element ({c},{s}) moved the score {before} -> {after}")
+
+    def test_equal_quality_agreement(self):
+        """When every element is identical, the aggregate equals that element exactly.
+
+        True under every pooling rule - a power mean of identical values is that value - which is
+        why the familiar single-number reading survives the redesign unchanged.
+        """
+        for dtype, bypass in self.VARIANTS:
+            with self.subTest(dtype=dtype, bypass_filter=bypass):
+                torch.manual_seed(43)
+                # Identical mixture across channels AND an identical residual on every element, so
+                # the per-element values are bit-identical rather than merely close.
+                u = ((torch.rand(1, 1, self.N) * 2 - 1).to(dtype)).expand(1, 2, self.N).contiguous()
+                t = (torch.rand(1, 2, 3, self.N) * 2 - 1).to(dtype)
+                d = (torch.rand(1, 1, 1, self.N) * 2 - 1).to(dtype) * 0.05
+                p = t + d
+
+                kw = dict(audio_length=self.N / SR, bypass_filter=bypass)
+                elements = per_element(u, p, t, **kw).flatten()
+                self.assertLess(float(elements.max() - elements.min()), 1e-4,
+                                "the construction is not actually equal-quality")
+                self.assertAlmostEqual(float(_metric(**kw)(u, p, t)), float(elements[0]), places=4)
+
+    def test_single_element_identity(self):
+        """Pooling one element is the identity - the mono, single-stem denoising case.
+
+        Guards against an aggregation change silently altering the most common usage of all.
+        """
+        for dtype, bypass in self.VARIANTS:
+            with self.subTest(dtype=dtype, bypass_filter=bypass):
+                u, p, t = self._graded([[0.08]], dtype)
+                kw = dict(audio_length=self.N / SR, bypass_filter=bypass)
+                element = float(per_element(u, p, t, **kw).flatten()[0])
+                self.assertAlmostEqual(float(_metric(**kw)(u, p, t)), element, places=5)
 
 
 class TestGradientAccumulationEquivalence(unittest.TestCase):

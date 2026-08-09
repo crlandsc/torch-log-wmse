@@ -67,6 +67,15 @@ def make_filter(audio_length=1.0, sample_rate=SR, **kw):
     return HumanHearingSensitivityFilter(audio_length=audio_length, sample_rate=sample_rate, **kw)
 
 
+def per_element(u, p, t, **kw):
+    """Per-[batch, channel, stem] values - the numbers pooling consumes.
+
+    The second adapter, alongside the constructors above: today these come from reduction="none",
+    and when `reduction` narrows to the batch axis they come from `per_stem()`. One edit, here.
+    """
+    return make_metric(reduction="none", **kw)(u, p, t)
+
+
 def bipolar(*shape, seed=None, scale=1.0):
     """U(-1, 1) * scale, seeded on request.
 
