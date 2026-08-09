@@ -98,11 +98,16 @@ class TestFilterPhaseIsIrrelevant(unittest.TestCase):
     all. Two consequences worth asserting: a delta impulse response anywhere gives exactly the
     unfiltered score, and rolling the impulse response changes nothing.
 
-    The delta-IR case is the single most valuable test in this file. It fails if the one-sided
-    Parseval doubling is missing (a clean 4*ln(2) = 2.7726 offset), if the energy is divided by the
-    transform size instead of the sample count, or if the transform is shorter than n + m - 1 and
-    the result is a circular convolution. Those three are otherwise near-invisible: two of them
-    read as plausible numbers and the third looks like FFT noise.
+    The delta-IR case reliably catches a wrong divisor and a too-short transform, both of which are
+    otherwise near-invisible - one reads as a plausible number, the other as FFT noise.
+
+    IT IS NOT A GUARD ON THE WEIGHT VECTOR'S SCALE, despite an earlier claim here that it caught a
+    missing one-sided doubling "as a clean 4*ln(2) = 2.7726 offset". It cannot: the same weights
+    divide out of `mse = weighted_error_energy / weighted_mixture_energy`, so ANY global factor on
+    them cancels exactly. Dropping the doubling is not quite global - DC and Nyquist keep their
+    coefficient either way - and the residual that leaves behind shrinks with buffer length, so it
+    is caught here at n=512 and MISSED at n=44100. `TestParsevalWeights` is the real guard on the
+    weights; this test is a guard on alignment and sizing.
 
     NOTE this is about the FILTER's phase. The metric is emphatically NOT phase-invariant with
     respect to the signals - the error is `estimate - target`, so a latency offset between the two
@@ -360,23 +365,62 @@ class TestGradientAllocation(unittest.TestCase):
     N = 8192
     LEVELS = (0.316, 0.1, 0.0316, 0.0178)  # -10, -20, -30, -35 dB: a 25 dB spread
 
-    def _shares(self, p):
+    def _shares(self, p, spectra="matched"):
+        """Gradient-energy shares per stem.
+
+        `spectra="matched"` gives every stem the SAME waveform at different gains, so their
+        residual spectra are proportional. That is the condition under which the exponent law is
+        the whole story - and asserting equality on it alone would be a degenerate test, so
+        `spectra="coloured"` exists and is used by the test below.
+        """
         torch.manual_seed(5)
         u = torch.rand(1, 1, self.N) * 2 - 1
         t = torch.rand(1, 1, 4, self.N) * 2 - 1
         levels = torch.tensor(self.LEVELS).reshape(1, 1, 4, 1)
-        estimate = (t + u[:, :, None, :] * levels).detach().requires_grad_(True)
+        if spectra == "matched":
+            residual = u[:, :, None, :] * levels
+        else:  # each stem's residual occupies a different band
+            time = torch.arange(self.N, dtype=torch.float32) / SR
+            tones = torch.stack([torch.sin(2 * math.pi * f * time)
+                                 for f in (200.0, 1000.0, 3000.0, 12000.0)])
+            residual = (tones / tones.pow(2).mean(dim=-1, keepdim=True).sqrt()).reshape(1, 1, 4, -1) * levels
+        estimate = (t + residual).detach().requires_grad_(True)
         _metric(p=p, return_as_loss=True)(u, estimate, t).backward()
         energy = torch.stack([estimate.grad[:, :, s].pow(2).sum() for s in range(4)])
         return energy / energy.sum(), float(estimate.grad.norm())
 
-    def test_gradient_energy_is_equal_across_stems_at_the_default(self):
+    def test_gradient_energy_is_equal_across_stems_of_matched_spectrum(self):
+        """The exponent law, on the case where it is the whole story.
+
+        Read the qualifier: MATCHED SPECTRUM. See the test below for what happens otherwise.
+        """
         shares, _ = self._shares(0.5)
         for i, share in enumerate(shares):
             with self.subTest(stem=i, level_db=round(20 * math.log10(self.LEVELS[i]))):
                 self.assertAlmostEqual(float(share), 0.25, places=3,
                                        msg=f"stem {i} takes {100 * float(share):.1f}% of the "
                                            "gradient energy, not 25%")
+
+    def test_equalisation_does_NOT_survive_differing_residual_spectra(self):
+        """The limit of the claim, pinned so it cannot quietly be overstated again.
+
+        Gradient energy is `G_s^2 * mse_s^(2p-1)`, not `mse_s^(2p-1)` alone. `p = 1/2` cancels the
+        exponent term and nothing else. `G_s^2` is an |H|^2-weighted mean of |H|^2 over that stem's
+        own residual spectrum, and the shipped filter spans about 35 dB across 30 Hz - 20 kHz, so
+        two stems with identical mse but residuals in different bands get very different gradient.
+
+        This is asserted as a KNOWN LIMITATION rather than a defect: no single p can cancel a
+        factor that does not depend on p. It exists so that "equal gradient energy" is never again
+        documented without its qualifier - the original measurement used one waveform at four
+        gains, which is exactly the degenerate case this guards against.
+        """
+        matched, _ = self._shares(0.5, spectra="matched")
+        coloured, _ = self._shares(0.5, spectra="coloured")
+        self.assertLess(float(matched.max() / matched.min()), 1.01,
+                        "matched spectra should equalise almost exactly")
+        self.assertGreater(float(coloured.max() / coloured.min()), 2.0,
+                           "if coloured residuals now equalise too, the G^2 factor has been "
+                           "cancelled somehow and the documented limitation should be revisited")
 
     def test_participation_ratio_reaches_the_stem_count(self):
         """1/sum(share^2) counts how many stems are effectively being trained. 4.00/4 is ideal."""
@@ -409,6 +453,127 @@ class TestGradientAllocation(unittest.TestCase):
         """The other half of GH #5: a runaway norm as stems converge."""
         norms = [self._shares(p)[1] for p in (0.0, 0.5)]
         self.assertLess(norms[1], norms[0])
+
+
+class TestIntegerAudioIsRejected(unittest.TestCase):
+    """Integer PCM used to return the "perfect" ceiling for ANY input, including the worst one.
+
+    Every tap of the hearing-sensitivity filter has magnitude below 1, so building the weight
+    vector in the input's dtype truncated all 4000 taps to zero for an integer input. Error energy
+    and mixture energy both came out 0 and the score pinned at +73.6827 - recreating, after the
+    fact, exactly the failure the all-zero guard in the constructor exists to prevent.
+
+    `soundfile.read(dtype='int16')` and `scipy.io.wavfile.read` both hand you this.
+    """
+
+    def test_integer_inputs_raise_instead_of_scoring_perfect(self):
+        n = 4410
+        mixture = torch.randint(-8000, 8000, (1, 1, n), dtype=torch.int16)
+        target = torch.randint(-8000, 8000, (1, 1, 1, n), dtype=torch.int16)
+        estimate = torch.zeros_like(target)  # the worst possible answer
+        for dtype in (torch.int16, torch.int32, torch.int64):
+            with self.subTest(dtype=dtype):
+                with self.assertRaisesRegex(TypeError, "must be a floating-point tensor"):
+                    _metric()(mixture.to(dtype), estimate.to(dtype), target.to(dtype))
+
+    def test_the_weight_vector_is_never_built_in_an_integer_dtype(self):
+        """The structural half of the fix: `HumanHearingSensitivityFilter` is public, so the guard
+        above is not the only way in."""
+        f = make_filter()
+        for dtype in (torch.int16, torch.int64, torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                w = f.weights_for(4410, dtype)
+                self.assertTrue(w.is_floating_point())
+                self.assertGreater(float(w.abs().max()), 0.0,
+                                   f"weights collapsed to zero for {dtype}")
+
+
+class TestLargePIsNumericallySafe(unittest.TestCase):
+    """`p` above about 5 used to return +-inf in float32, and the failure arrived LATE.
+
+    `x.pow(p).mean().pow(1/p)` raises to the p-th power before the mean, so with a bit-exact stem
+    (x = EPS = 1e-8) and p=6, x**p = 1e-48 underflows float32 to exactly 0 - mean 0, root 0,
+    log(0), score +inf. In training that means the loss behaves normally and then dies once the
+    model gets GOOD, and under reduction="mean" one such item poisons the whole batch.
+
+    Pooling is now done in the log domain via logsumexp, which subtracts its own maximum.
+    """
+
+    P_VALUES = (0.5, 2.0, 5.0, 6.0, 8.0, 20.0, 64.0)
+
+    def test_an_exact_match_returns_the_ceiling_at_every_p(self):
+        torch.manual_seed(2)
+        u = torch.rand(1, 1, 4096) * 2 - 1
+        t = torch.rand(1, 1, 2, 4096) * 2 - 1
+        for p in self.P_VALUES:
+            with self.subTest(p=p):
+                self.assertAlmostEqual(float(_metric(p=p)(u, t.clone(), t)), CEILING, places=3)
+
+    def test_gradients_stay_finite_at_every_p(self):
+        torch.manual_seed(3)
+        u = torch.rand(1, 1, 4096) * 2 - 1
+        t = torch.rand(1, 1, 2, 4096) * 2 - 1
+        for p in self.P_VALUES:
+            with self.subTest(p=p):
+                estimate = t.clone().requires_grad_(True)  # bit-exact: the case that used to break
+                _metric(p=p, return_as_loss=True)(u, estimate, t).backward()
+                self.assertTrue(torch.isfinite(estimate.grad).all(), f"NaN/inf gradient at p={p}")
+
+    def test_the_log_domain_form_agrees_with_the_direct_one_where_both_are_safe(self):
+        """Guards the rewrite itself: within float32's safe range the two must still agree."""
+        torch.manual_seed(4)
+        mse = torch.rand(3, 2, 4) * 0.1 + 1e-4
+        from torch_log_wmse.constants import EPS, SCALER
+        from torch_log_wmse.metric import pool_mse
+        for p in (0.25, 0.5, 1.0, 2.0, 4.0):
+            with self.subTest(p=p):
+                direct = torch.log((mse + EPS).pow(p).mean(dim=(1, 2)).pow(1.0 / p)) * SCALER
+                self.assertTrue(torch.allclose(pool_mse(mse, p), direct, atol=1e-5))
+
+
+class TestTheFilterActuallyShapesTheScore(unittest.TestCase):
+    """Guards a structural blind spot: almost nothing else in this file can see the filter.
+
+    Because `mse = weighted_error_energy / weighted_mixture_energy`, ANY linear weighting cancels
+    out of the `estimate = k * mixture` oracle. Replacing the hearing-sensitivity curve with a flat
+    response leaves TestClosedFormOracle, TestScaleInvariance, TestAggregationContract,
+    TestGradientAllocation, TestEdgeRingIsNowCounted, TestGradients, TestDigitalSilence and
+    TestReductionSemantics all passing - measured, not assumed.
+
+    Only recorded goldens and the OPTIONAL upstream-parity module caught it, and a suite whose only
+    guard on its central feature is a self-recorded number plus an optional dependency is one
+    regeneration away from not testing it at all.
+    """
+
+    N = 8192
+
+    def _score_for_tone(self, freq):
+        torch.manual_seed(11)
+        time = torch.arange(self.N, dtype=torch.float32) / SR
+        u = torch.rand(1, 1, self.N) * 2 - 1
+        t = torch.zeros(1, 1, 1, self.N)
+        tone = torch.sin(2 * math.pi * freq * time)
+        residual = (tone / tone.pow(2).mean().sqrt() * 0.01).reshape(1, 1, 1, -1)
+        return float(_metric()(u, residual, t))
+
+    def test_error_in_the_ear_s_sensitive_band_is_penalised_hardest(self):
+        """An equal-energy error at 3 kHz must score WORSE than the same energy at 40 Hz or 16 kHz.
+
+        This is the hearing curve's entire purpose, and it is what a flat response destroys.
+        """
+        mid = self._score_for_tone(3000.0)
+        for freq in (40.0, 200.0, 16000.0):
+            with self.subTest(freq=freq):
+                self.assertLess(mid, self._score_for_tone(freq),
+                                f"error at 3 kHz should be penalised more than at {freq:.0f} Hz; "
+                                "a flat weighting would make these equal")
+
+    def test_the_weighting_spans_a_wide_dynamic_range(self):
+        """A near-flat response would pass the ordering test above while still being wrong."""
+        spread = self._score_for_tone(16000.0) - self._score_for_tone(3000.0)
+        self.assertGreater(spread, 5.0,
+                           f"only {spread:.2f} units between 3 kHz and 16 kHz; the weighting has "
+                           "been flattened")
 
 
 class TestClassSplit(unittest.TestCase):
@@ -496,7 +661,8 @@ class TestReductionSemantics(unittest.TestCase):
     merely observed, because "sum" quietly changing by a factor of channels x stems is exactly the
     sort of thing that reads as a plausible number downstream.
 
-    Kills M21 (mean over wrong dim) and M13 (mean/sum swapped).
+    Kills M13 (mean/sum swapped). The M21 reference here was stale - that mutant patched
+    `mean_diff = (differences**2).mean(dim=-1)`, a line the frequency-domain rewrite deleted.
     """
 
     def test_none_mean_sum_are_mutually_consistent_over_the_batch(self):
@@ -613,7 +779,11 @@ class TestGradients(unittest.TestCase):
 
 
 class TestDigitalSilence(unittest.TestCase):
-    """Digital silence must not produce NaN anywhere. Regression guard for the 0.2.8 bug and M14."""
+    """Digital silence must not produce NaN anywhere.
+
+    Regression guard for the 0.2.8 divide-by-zero. Its mutant, M14, was retired along with the
+    time-domain scaling code it patched, so this test is now the only guard on that behaviour.
+    """
 
     def test_all_silent_triplet_is_the_ceiling(self):
         n = 8192
@@ -691,31 +861,41 @@ class TestImpulseResponseValidation(unittest.TestCase):
         self.assertTrue(math.isfinite(float(m(u, p, torch.zeros_like(p)))))
 
 class TestSilenceGradients(unittest.TestCase):
-    """A digitally silent, grad-requiring input must not poison the graph.
+    """A digitally silent, grad-requiring mixture must not poison the graph.
 
     The original failure: an RMS is the sqrt of a mean square, and at exactly zero sqrt has an
     infinite derivative, so the forward value stayed finite while the backward pass produced NaN.
     Reachable when the "unprocessed" signal is an upstream module's output in a cascaded system.
 
-    1.0.0 removes the square root rather than guarding it - the metric clamps a MEAN SQUARE at
-    RMS_EPS**2 and never takes a root - so this is now testing that the failure mode is absent by
-    construction. Asserted end to end through the metric, which is the only thing that can regress.
+    1.0.0 closes it twice over. The metric never takes a square root - it clamps a MEAN SQUARE at
+    RMS_EPS**2 - and the mixture's level is DETACHED, so no gradient reaches it at all.
+
+    Detaching is a correctness fix, not a convenience. The mixture is the reference the error is
+    measured against; left attached it is a gradient path, and `d(loss)/d(log mixture gain)` was
+    measured at exactly -8.0. In any setup where the mixture carries gradient, the objective could
+    then be reduced by making the MIXTURE LOUDER rather than the estimate better.
     """
 
-    def test_gradient_through_a_silent_mixture_is_finite_in_every_dtype(self):
+    def test_the_mixture_receives_no_gradient(self):
+        for dtype in (torch.float32, torch.float64):
+            with self.subTest(dtype=dtype):
+                u = (torch.rand(1, 1, 4096, dtype=dtype) * 2 - 1).requires_grad_(True)
+                t = torch.rand(1, 1, 2, 4096, dtype=dtype) * 2 - 1
+                estimate = (t + 0.05).requires_grad_(True)
+                _metric(return_as_loss=True)(u, estimate, t).backward()
+                self.assertIsNone(u.grad, "the mixture is a reference level, not an optimisation "
+                                          "target; a gradient here means the detach was lost")
+                self.assertGreater(float(estimate.grad.norm()), 0.0,
+                                   "the estimate must still receive gradient")
+
+    def test_a_silent_grad_requiring_mixture_leaves_the_estimate_gradient_finite(self):
         for dtype in (torch.float32, torch.float64):
             with self.subTest(dtype=dtype):
                 z = torch.zeros(1, 1, 4096, dtype=dtype, requires_grad=True)
-                p = torch.randn(1, 1, 1, 4096, dtype=dtype)
-                _metric(return_as_loss=True)(z, p, torch.zeros_like(p)).backward()
-                self.assertTrue(torch.isfinite(z.grad).all())
-
-    def test_grad_requiring_silent_mixture_does_not_produce_nan(self):
-        n = 4096
-        u = torch.zeros(1, 1, n, requires_grad=True)
-        m = _metric(audio_length=n / SR, return_as_loss=True)
-        m(u, torch.randn(1, 1, 1, n), torch.zeros(1, 1, 1, n)).backward()
-        self.assertTrue(torch.isfinite(u.grad).all())
+                t = torch.zeros(1, 1, 1, 4096, dtype=dtype)
+                estimate = torch.randn(1, 1, 1, 4096, dtype=dtype).requires_grad_(True)
+                _metric(return_as_loss=True)(z, estimate, t).backward()
+                self.assertTrue(torch.isfinite(estimate.grad).all())
 
     def test_silent_mixture_scaling_is_pinned_to_rms_eps(self):
         """A silent mixture must scale by exactly 1/RMS_EPS, and the resulting value is pinned.
@@ -1254,11 +1434,37 @@ class TestTransformSizing(unittest.TestCase):
                 self.assertEqual(weights.dtype, dtype,
                                  f"weights for a {dtype} input were built as {weights.dtype}")
 
-    def test_the_cache_is_capped(self):
+    def test_the_cache_is_capped_and_evicts_the_OLDEST_entry(self):
+        """The cap alone is not worth asserting - a cache that stored nothing would satisfy it.
+
+        Eviction ORDER is the part that matters and the part that was untested: swapping the FIFO
+        `pop(next(iter(...)))` for `popitem()` turns an LRU into a LIFO that thrashes on any
+        variable-length workload, and it used to pass the entire suite unchanged.
+        """
         f = make_filter(cache_size=3)
-        for n in (1000, 2000, 4000, 8000, 16000, 32000):
+        lengths = [1000, 2000, 4000, 8000, 16000, 32000]
+        for n in lengths:
             f(torch.rand(1, 1, 1, n))
-        self.assertLessEqual(len(f._weights), 3)
+        self.assertEqual(len(f._weights), 3)
+        # The three most RECENT sizes must be what survived.
+        survived = {key[0] for key in f._weights}
+        self.assertEqual(survived, {f.transform_size(n) for n in lengths[-3:]},
+                         "eviction is not first-in-first-out; the newest entries were discarded")
+
+    def test_cache_size_is_validated(self):
+        for bad in (0, -1):
+            with self.subTest(cache_size=bad):
+                with self.assertRaisesRegex(ValueError, "cache_size must be at least 1"):
+                    make_filter(cache_size=bad)
+
+    def test_moving_or_recasting_the_module_drops_the_cache(self):
+        """A `.half()` after a forward pass used to leave float32-derived weights cached under a
+        key that no longer described them, and the next call silently reused them."""
+        f = make_filter()
+        f(torch.rand(1, 1, 1, 2048))
+        self.assertEqual(len(f._weights), 1)
+        f.to(torch.float64)
+        self.assertEqual(len(f._weights), 0, "cache survived a dtype change")
 
     def test_a_single_instance_reproduces_per_length_instances(self):
         """The whole point of dropping audio_length: one instance, any length, same numbers."""

@@ -157,11 +157,26 @@ class TestPoolingShapesTheRecordedValues(unittest.TestCase):
                     self.assertAlmostEqual(rec["pooled"], sum(flat) / len(flat), delta=1e-3)
 
     def test_it_is_strictly_below_the_mean_on_the_graded_cases(self):
-        """The whole point of the change, visible in the recorded numbers."""
-        for name in ("graded_stereo_2stem", "graded_stereo_4stem", "exact_one_stem"):
+        """The whole point of the change - RECOMPUTED, not read back from the file.
+
+        Every other test in this class reads `goldens.json`, which means its verdict cannot change
+        unless the file does: reverting the default p to 0 left them all green. This one calls the
+        metric, so it actually pins the pooling rule.
+
+        `exact_one_stem` is deliberately NOT in the list. Two of its elements sit at the ceiling
+        with exactly zero gradient and the rest span 0.11 units, so the entire gap between pooled
+        and mean comes from the pinned elements - it cannot discriminate between aggregation rules
+        among the stems that are actually converging.
+        """
+        from tests.golden_cases import cases, evaluate
+
+        specs = {c["name"]: c for c in cases()}
+        for name in ("graded_stereo_2stem", "graded_stereo_4stem"):
             with self.subTest(case=name):
-                flat = _flatten(self.golden[name]["per_element"])
-                self.assertLess(self.golden[name]["pooled"], sum(flat) / len(flat) - 1.0)
+                rec = evaluate(specs[name])
+                flat = _flatten(rec["per_element"])
+                self.assertLess(rec["pooled"], sum(flat) / len(flat) - 1.0,
+                                "pooling is behaving like a plain mean of the per-stem scores")
 
     @classmethod
     def setUpClass(cls):

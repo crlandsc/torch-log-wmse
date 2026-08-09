@@ -107,6 +107,15 @@ def _quantized_size(required: int) -> int:
     return next_fft_friendly_size(max(rung, required))
 
 
+def _weight_dtype(dtype: torch.dtype) -> torch.dtype:
+    """The dtype the weight vector is built in: floating point, and never below float32.
+
+    Integer dtypes would truncate the sub-unity impulse response to zeros; float16 and bfloat16
+    carry too few mantissa bits for `|H|^2`, which spans about 156 dB across the shipped filter.
+    """
+    return dtype if dtype in (torch.float32, torch.float64) else torch.float32
+
+
 def parseval_weights(impulse_response: Tensor, transform_size: int) -> Tensor:
     """Per-bin weights `w[f] = |H(f)|^2 * c[f] / L` for one-sided Parseval.
 
@@ -196,19 +205,26 @@ class HumanHearingSensitivityFilter(torch.nn.Module):
                 f"impulse_response_sample_rate must be positive, got {impulse_response_sample_rate}"
             )
 
+        if cache_size < 1:
+            raise ValueError(
+                f"cache_size must be at least 1, got {cache_size}. Zero or negative made the "
+                "eviction branch fire on an empty cache and raise a bare StopIteration."
+            )
+
         # Load the impulse response if not provided
         if impulse_response is None:
             impulse_response = load_bundled_impulse_response()
 
-        # Resample the impulse response if necessary
-        if impulse_response_sample_rate != sample_rate:
-            resampler = Resample(orig_freq=impulse_response_sample_rate, new_freq=sample_rate)
-            impulse_response = resampler(impulse_response)
-
-        # Remove any singleton dimensions, then validate. Without these checks a wrong-rank impulse
-        # response is silently broadcast against the stem axis instead of raising, and a degenerate one
-        # (all zeros, or containing NaN) corrupts every result: an all-zero IR makes the metric report
-        # its "perfect" ceiling for every input, forever.
+        # CONVERT AND VALIDATE BEFORE RESAMPLING, not after. Resample() needs a float32 torch
+        # tensor, so running it first meant a list, a numpy array or a float64 tensor worked
+        # perfectly at 44.1 kHz and died at any other rate with an error naming neither the
+        # impulse response nor the dtype requirement ("'list' object has no attribute
+        # 'is_floating_point'"). Every accepted input type now behaves the same at every rate.
+        #
+        # The checks themselves: without them a wrong-rank impulse response is silently broadcast
+        # against the stem axis instead of raising, and a degenerate one (all zeros, or containing
+        # NaN) corrupts every result - an all-zero IR makes the metric report its "perfect" ceiling
+        # for every input, forever.
         impulse_response = torch.as_tensor(impulse_response, dtype=torch.float32).squeeze()
         if impulse_response.ndim != 1:
             raise ValueError(
@@ -225,6 +241,12 @@ class HumanHearingSensitivityFilter(torch.nn.Module):
             raise ValueError(
                 "impulse_response is all zeros, which would make every comparison report a perfect score."
             )
+
+        # Resample only now, on a validated float32 tensor.
+        if impulse_response_sample_rate != sample_rate:
+            resampler = Resample(orig_freq=impulse_response_sample_rate, new_freq=sample_rate)
+            impulse_response = resampler(impulse_response)
+
         # persistent=False: a derived constant, not learned state. See the class docstring.
         self.register_buffer("impulse_response", impulse_response, persistent=False)
 
@@ -248,21 +270,37 @@ class HumanHearingSensitivityFilter(torch.nn.Module):
     def weights_for(self, n_samples: int, dtype: torch.dtype) -> Tensor:
         """Cached Parseval weights for this input length, dtype and device.
 
-        Resolved OUTSIDE any compiled region and passed to `forward` as a plain tensor, so the dict
-        lookup never enters the graph.
+        Built in the input's dtype so a float32 weight vector is never handed to a float64 signal,
+        which would silently downgrade the computation and the float64 gradcheck with it.
 
-        Built in the input's real dtype: a float32 weight vector handed to a float64 signal would
-        silently downgrade the whole computation, and the float64 gradcheck along with it.
+        THE DTYPE IS FORCED TO FLOATING POINT FIRST, and that is not a nicety. Every tap of the
+        hearing-sensitivity impulse response has magnitude below 1, so casting it to an integer
+        dtype truncates all 4000 taps to zero. The weight vector then becomes all zeros, the error
+        and mixture energies both come out 0, and the metric reports its "perfect" ceiling for
+        EVERY input - which is precisely the failure the all-zero guard in `__init__` exists to
+        prevent, recreated after that guard has run. Integer audio is not exotic: it is what
+        `soundfile.read(dtype='int16')` and `scipy.io.wavfile.read` hand you.
         """
+        dtype = _weight_dtype(dtype)
         length = self.transform_size(n_samples)
         key = (length, self.impulse_response.device, dtype)
         cached = self._weights.get(key)
         if cached is None:
             cached = parseval_weights(self.impulse_response.to(dtype), length)
-            if len(self._weights) >= self.cache_size:
+            if self.cache_size and len(self._weights) >= self.cache_size:
                 self._weights.pop(next(iter(self._weights)))  # oldest out; insertion-ordered dict
             self._weights[key] = cached
         return cached
+
+    def _apply(self, *args, **kwargs):
+        """Drop the cache whenever the module is moved or recast.
+
+        `.to()`, `.half()`, `.double()` and `.cuda()` all route through here. Without this, a
+        `.half()` after a forward pass leaves float32-derived weights cached under a key that no
+        longer describes them, and the next call silently reuses them.
+        """
+        self._weights.clear()
+        return super()._apply(*args, **kwargs)
 
     def forward(self, audio: Tensor) -> Tensor:
         """Total energy of the frequency-weighted signal, per [batch, channel, stem].

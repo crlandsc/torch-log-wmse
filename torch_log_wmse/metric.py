@@ -88,7 +88,12 @@ def per_element_mse(
     differences = processed_audio - target_audio
     n_samples = differences.shape[-1]
     energy = weighted_energy(differences, filters, bypass_filter)
-    floor = torch.clamp_min(input_mean_square.to(energy.dtype), RMS_EPS**2)
+    # DETACHED. The mixture's level is a reference the error is measured against, not something to
+    # optimise. Left attached, it is a gradient path: measured d(loss)/d(log mixture gain) = -8.0
+    # exactly, so whenever `unprocessed_audio` carries gradient - a cascaded system, or learned
+    # augmentation - the objective can be minimised by making the mixture LOUDER instead of the
+    # estimate better. The forward value is unchanged either way.
+    floor = torch.clamp_min(input_mean_square.detach().to(energy.dtype), RMS_EPS**2)
     return energy / (n_samples * floor)
 
 
@@ -157,10 +162,25 @@ def pool_mse(mse: Tensor, p: float) -> Tensor:
     Returns:
         Tensor: [batch].
     """
-    shifted = _shifted(mse)
+    log_x = torch.log(_shifted(mse))
     if p == 0.0:
-        return torch.log(shifted).mean(dim=(1, 2)) * SCALER
-    return torch.log(shifted.pow(p).mean(dim=(1, 2)).pow(1.0 / p)) * SCALER
+        return log_x.mean(dim=(1, 2)) * SCALER
+
+    # Computed in the LOG DOMAIN via logsumexp, not as `x.pow(p).mean().pow(1/p)`.
+    #
+    #     log M_p = (1/p) * ( logsumexp(p * log x) - log S )
+    #
+    # The direct form raises to the p-th power BEFORE the mean, and in float32 that overflows and
+    # underflows for perfectly ordinary p. With a bit-exact stem, x = EPS = 1e-8, so x**6 = 1e-48
+    # underflows to exactly 0; the mean is then 0, its p-th root is 0, and log(0) makes the score
+    # +inf. That is not a corner case in training: the loss behaves normally and then dies once the
+    # model gets GOOD, and under reduction="mean" one such batch item poisons the whole batch.
+    # Measured before this change: p=6 returned +inf, p=20 returned a plausible forward value with
+    # a NaN gradient. logsumexp subtracts its own maximum, so the whole safe range widens to any p
+    # the constructor accepts, in float32 as well as float64.
+    flat = log_x.flatten(1)
+    log_mean_pow = torch.logsumexp(p * flat, dim=1) - math.log(flat.shape[1])
+    return (log_mean_pow / p) * SCALER
 
 
 class LogWMSE(torch.nn.Module):
@@ -290,6 +310,21 @@ class LogWMSE(torch.nn.Module):
         # Validation raises rather than asserting: `python -O` strips assert statements, and these
         # checks are load-bearing. Without the batch/channel checks in particular, a mismatch
         # BROADCASTS and silently returns a plausible-looking number instead of failing.
+        # Integer audio is rejected rather than promoted. Unnormalised PCM straight from
+        # `soundfile.read(dtype='int16')` or `scipy.io.wavfile.read` is a common mistake, and every
+        # tap of the hearing-sensitivity filter has magnitude below 1 - so an integer dtype used to
+        # truncate the whole filter to zeros and report the "perfect" ceiling for ANY input,
+        # including pure silence against a loud target. `weights_for` now forces a float dtype, so
+        # this is no longer load-bearing, but a metric that silently accepts integer waveforms is
+        # hiding a data-loading bug rather than reporting one.
+        for name, t in (("unprocessed_audio", unprocessed_audio),
+                        ("processed_audio", processed_audio), ("target_audio", target_audio)):
+            if not t.is_floating_point():
+                raise TypeError(
+                    f"{name} must be a floating-point tensor, got {t.dtype}. Convert your audio to "
+                    "float first, e.g. `x.float() / 32768` for int16 PCM. (The metric is "
+                    "scale-invariant, so the divisor only matters for readability.)"
+                )
         if unprocessed_audio.ndim != 3:
             raise ValueError(
                 "unprocessed_audio must have shape [batch, channel, time], got "
