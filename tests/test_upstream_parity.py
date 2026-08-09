@@ -26,9 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import unittest
 
-from torch_log_wmse import LogWMSE
-
-torch.set_num_threads(2)
+from tests.conftest import SR, make_filter, make_metric
 
 # numpy is imported HERE, not at module scope: it arrives with the reference package (via scipy) and is
 # only ever used to talk to it. Importing it at module scope made this module fail COLLECTION in a bare
@@ -41,21 +39,41 @@ except ImportError:  # pragma: no cover - exercised only when the optional dep i
     np = None
     _upstream = None
 
-SR = 44100
 # Tolerance rationale: both implementations are float32 FFT convolutions, so they agree to a few
 # float32 eps on the filtered signal. Measured worst case across the cases below is ~3.6e-07 on the
 # filter output, which lands well inside 1e-4 on the log-domain metric.
 TOL = 1e-4
 
 
+def _as_batch(x):
+    """numpy [channel, time] -> torch [1, channel, stem=1, time], and the mixture's [1, channel, time]."""
+    return torch.from_numpy(np.atleast_2d(x))
+
+
 def _torch_metric(unprocessed, processed, target, sample_rate=SR):
-    """Run this port on numpy inputs shaped like upstream's, returning a float."""
+    """Run this port on numpy inputs shaped like upstream's, returning the POOLED float."""
     audio_length = unprocessed.shape[-1] / sample_rate
-    m = LogWMSE(audio_length=audio_length, sample_rate=sample_rate, return_as_loss=False)
-    u = torch.from_numpy(np.atleast_2d(unprocessed))
-    p = torch.from_numpy(np.atleast_2d(processed))
-    t = torch.from_numpy(np.atleast_2d(target))
+    m = make_metric(audio_length=audio_length, sample_rate=sample_rate)
+    u, p, t = _as_batch(unprocessed), _as_batch(processed), _as_batch(target)
     return float(m(u[None], p[None, :, None, :], t[None, :, None, :]))
+
+
+def _torch_per_element(unprocessed, processed, target, sample_rate=SR):
+    """Per-[channel, stem] values from this port, as a nested list.
+
+    `processed`/`target` may carry a stem axis: [channel, stem, time]. `unprocessed` is always
+    [channel, time], since the mixture has no stems.
+
+    This is the one place that reads unreduced values. When `reduction` narrows to the batch axis,
+    this becomes `per_stem(...)` and nothing else in the module changes.
+    """
+    audio_length = unprocessed.shape[-1] / sample_rate
+    m = make_metric(audio_length=audio_length, sample_rate=sample_rate, reduction="none")
+    u = _as_batch(unprocessed)[None]
+    p, t = torch.from_numpy(processed), torch.from_numpy(target)
+    if p.ndim == 2:  # [channel, time] -> [channel, stem=1, time]
+        p, t = p[:, None, :], t[:, None, :]
+    return m(u, p[None], t[None])[0].tolist()  # [channel][stem]
 
 
 @unittest.skipIf(_upstream is None, "log-wmse-audio-quality not installed (needs scipy + soxr)")
@@ -82,6 +100,9 @@ class TestUpstreamParity(unittest.TestCase):
         self._assert_parity(u, p, t, "independent est/target")
 
     def test_stereo(self):
+        # NOTE: both channels get the same treatment, so this is blind to how channels COMBINE -
+        # every aggregation rule passes it with delta exactly 0. TestUnequalChannelsAndStems below
+        # is what actually covers that.
         rng = np.random.default_rng(13)
         u = rng.uniform(-1, 1, (2, SR)).astype(np.float32)
         self._assert_parity(u, (u * 0.1).astype(np.float32), np.zeros_like(u), "stereo")
@@ -124,6 +145,82 @@ class TestUpstreamParity(unittest.TestCase):
         self.assertAlmostEqual(_torch_metric(z, z.copy(), z.copy()), 73.68, delta=0.01)
 
 
+@unittest.skipIf(_upstream is None, "log-wmse-audio-quality not installed (needs scipy + soxr)")
+class TestUnequalChannelsAndStems(unittest.TestCase):
+    """How channels and stems COMBINE - the blind spot in every test above.
+
+    `TestUpstreamParity.test_stereo` gives both channels the same treatment, so the two per-channel
+    values are identical and EVERY aggregation rule reproduces upstream with delta exactly 0. That
+    gap matters because aggregation is the one thing 1.0.0 deliberately changes.
+
+    The durable anchor is the PER-ELEMENT comparison: each [channel, stem] value must equal upstream
+    run on that pair alone. It survives the pooling change, because pooling consumes these values
+    rather than producing them. The pooled comparison is the one that will legitimately move.
+    """
+
+    # A distinct residual level per (channel, stem), spanning 30 dB, so no two elements agree.
+    LEVELS = ((0.316, 0.1, 0.0316), (0.0562, 0.0178, 0.01))
+
+    def _case(self, seed=101, stems=3):
+        rng = np.random.default_rng(seed)
+        u = rng.uniform(-1, 1, (2, SR)).astype(np.float32)
+        levels = np.array([row[:stems] for row in self.LEVELS], dtype=np.float32)
+        p = (u[:, None, :] * levels[:, :, None]).astype(np.float32)
+        t = np.zeros_like(p)
+        return u, p, t
+
+    def _upstream_element(self, u, p, t, c, s):
+        """Upstream on one (channel, stem) pair, as mono."""
+        return float(_upstream(u[c : c + 1], p[c, s][None], t[c, s][None], SR))
+
+    def test_per_element_values_match_upstream(self):
+        """THE fidelity anchor. Must still hold after the pooling rule changes."""
+        u, p, t = self._case()
+        got = _torch_per_element(u, p, t)
+        for c in range(p.shape[0]):
+            for s in range(p.shape[1]):
+                with self.subTest(channel=c, stem=s):
+                    ref = self._upstream_element(u, p, t, c, s)
+                    self.assertAlmostEqual(
+                        got[c][s], ref, delta=TOL,
+                        msg=f"element [{c},{s}]: this port {got[c][s]!r} vs upstream {ref!r}")
+
+    def test_elements_are_actually_unequal(self):
+        """Guards the guard: if the levels ever collapse, this class silently stops testing anything."""
+        u, p, t = self._case()
+        flat = [v for row in _torch_per_element(u, p, t) for v in row]
+        self.assertGreater(max(flat) - min(flat), 20.0,
+                           f"per-element spread collapsed to {max(flat) - min(flat):.2f}; the case is "
+                           "no longer exercising aggregation")
+
+    def test_upstream_pools_channels_as_the_mean_of_logs(self):
+        """Pins WHAT upstream does across channels, so our divergence from it stays a decision.
+
+        Measured exact (delta 0.00e+00): upstream's stereo value is the arithmetic mean of its two
+        mono values, i.e. mean-of-logs. That is the rule 1.0.0 replaces with a power mean.
+        """
+        u, p, t = self._case(stems=1)
+        pooled = float(_upstream(u, p[:, 0], t[:, 0], SR))
+        per_channel = [self._upstream_element(u, p, t, c, 0) for c in range(2)]
+        self.assertAlmostEqual(pooled, sum(per_channel) / len(per_channel), delta=TOL)
+        # And it is emphatically NOT a log of the mean MSE, which would read ~6.5 units lower here.
+        mean_mse = sum(math.exp(v / -4.0) for v in per_channel) / len(per_channel)
+        self.assertGreater(abs(pooled - (-4.0 * math.log(mean_mse))), 1.0)
+
+    def test_pooled_value_matches_upstream_for_unequal_channels(self):
+        """True while pooling is mean-of-logs (p = 0).
+
+        EXPECTED TO CHANGE when the default p moves to 1/2: this is the assertion that proves the
+        aggregation rule actually moved, so update it deliberately with the measured delta rather
+        than deleting it.
+        """
+        u, p, t = self._case(stems=1)
+        ref = float(_upstream(u, p[:, 0], t[:, 0], SR))
+        got = _torch_metric(u, p[:, 0], t[:, 0])
+        self.assertAlmostEqual(got, ref, delta=TOL,
+                               msg=f"unequal-channel pooled: {got!r} vs upstream {ref!r}")
+
+
 class TestDivergenceIsDeliberate(unittest.TestCase):
     """Below 44.1 kHz the two implementations are EXPECTED to differ, and this pins that expectation.
 
@@ -149,8 +246,7 @@ class TestDivergenceIsDeliberate(unittest.TestCase):
     def test_44k1_is_the_supported_rate(self):
         # Guards the assumption the parity tests above rest on: the bundled IR is designed at 44.1 kHz
         # and is used unresampled there.
-        from torch_log_wmse.freq_weighting_filter import HumanHearingSensitivityFilter
-        f = HumanHearingSensitivityFilter(audio_length=0.05, sample_rate=SR)
+        f = make_filter(audio_length=0.05, sample_rate=SR)
         self.assertEqual(f.impulse_response.shape[-1], 4000)
 
 
