@@ -156,17 +156,20 @@ class TestPoolingShapesTheRecordedValues(unittest.TestCase):
                 with self.subTest(case=name):
                     self.assertAlmostEqual(rec["pooled"], sum(flat) / len(flat), delta=1e-3)
 
-    def test_it_is_strictly_below_the_mean_on_the_graded_cases(self):
-        """The whole point of the change - RECOMPUTED, not read back from the file.
+    def test_the_default_pools_as_the_mean_and_p_half_does_not(self):
+        """RECOMPUTED, not read back from the file - which is the point.
 
-        Every other test in this class reads `goldens.json`, which means its verdict cannot change
-        unless the file does: reverting the default p to 0 left them all green. This one calls the
-        metric, so it actually pins the pooling rule.
+        Every other test in this class reads `goldens.json`, so its verdict cannot change unless
+        the file does; changing the default p left them all green. This one calls the metric, so it
+        actually pins the pooling rule, in both directions:
 
-        `exact_one_stem` is deliberately NOT in the list. Two of its elements sit at the ceiling
-        with exactly zero gradient and the rest span 0.11 units, so the entire gap between pooled
-        and mean comes from the pinned elements - it cannot discriminate between aggregation rules
-        among the stems that are actually converging.
+        * the DEFAULT (p=0) must equal the mean of the per-stem scores - the compatibility promise
+        * p=0.5 must be strictly below it on a graded case - the knob has to do something
+
+        `exact_one_stem` is deliberately excluded. Two of its elements sit at the ceiling with
+        exactly zero gradient and the rest span 0.11 units, so the whole gap between pooled and
+        mean comes from the pinned elements. It cannot discriminate between aggregation rules among
+        the stems that are actually converging.
         """
         from tests.golden_cases import cases, evaluate
 
@@ -175,8 +178,13 @@ class TestPoolingShapesTheRecordedValues(unittest.TestCase):
             with self.subTest(case=name):
                 rec = evaluate(specs[name])
                 flat = _flatten(rec["per_element"])
-                self.assertLess(rec["pooled"], sum(flat) / len(flat) - 1.0,
-                                "pooling is behaving like a plain mean of the per-stem scores")
+                mean = sum(flat) / len(flat)
+                self.assertAlmostEqual(rec["pooled"], mean, delta=1e-3,
+                                       msg="the default no longer pools as a plain mean")
+                spec = dict(specs[name])
+                spec["config"] = {**(spec.get("config") or {}), "p": 0.5}
+                self.assertLess(evaluate(spec)["pooled"], mean - 1.0,
+                                "p=0.5 is not distinguishable from the default")
 
     @classmethod
     def setUpClass(cls):

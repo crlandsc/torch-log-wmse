@@ -112,9 +112,11 @@ Updated README to reflect 0.2.8 `bypass_filter` update.
 - `torch_log_wmse_audio_quality` inherits version through import
 ## 1.0.0 (unreleased)
 
-Two things happened here. A full adversarial audit of the library against its upstream, `nomonosound/log-wmse-audio-quality`, and then a redesign that the audit made unavoidable: it found that **the loss starves the stem that most needs gradient**, which no amount of tuning fixes because it is inherent to averaging in the log domain.
+A full adversarial audit of the library against its upstream, `nomonosound/log-wmse-audio-quality`, followed by a redesign of the API and the internals, and then a second adversarial audit of that redesign.
 
-This is where the `0.x` "anything may change" signal stops being true. The API is deliberate rather than accumulated, and it is a breaking release in almost every direction. Every change below is backed by a reproduced measurement; where a previously suspected problem turned out not to be real, that is recorded too, because several of them looked convincing.
+**The API is a breaking change in almost every direction. The numbers are not.** Aggregation across stems is unchanged, so multi-stem and stereo scores stay comparable with earlier versions and with published logWMSE figures. Values move only from two removed mechanisms — a per-sample inaudibility gate and a window trim — and for ordinary broadband material that is under 6e-04.
+
+This is where the `0.x` "anything may change" signal stops being true. Every change below is backed by a reproduced measurement; where a previously suspected problem turned out not to be real, or where a claim in an earlier draft of these notes turned out to be wrong, that is recorded too. Several of them looked convincing.
 
 ### Migrating from 0.x
 
@@ -130,35 +132,39 @@ This is where the `0.x` "anything may change" signal stops being true. The API i
 
 Both removed constructor arguments raise `TypeError` naming their replacement rather than being ignored. The constructor is keyword-only specifically because `audio_length` used to come first: a positional call written for 0.x would otherwise put a duration where `sample_rate` now is and quietly build a metric at 1 Hz.
 
-**Values change** for multi-stem and stereo inputs. Single-stem mono results are unaffected by the aggregation change. Pass `p=0` to restore the previous aggregation exactly.
+**Aggregation is unchanged.** The new `p` parameter defaults to `0`, which is the mean-of-logs every earlier version used, so multi-stem and stereo scores stay comparable.
 
-### Why the aggregation changed
+### The new `p` parameter, and why the default is 0
 
-The metric averaged the logs of the per-stem errors. That sounds neutral and is not: in the log domain, a stem that is already good contributes as much *movement* per unit of relative improvement as a stem that is terrible, so the gradient flows to wherever the relative error is easiest to shrink. With four stems spread over 25 dB, the worst stem received **0.2%** of the gradient energy and the best-converged took 74%.
+A multi-stem model produces one error per stem and they have to become one number. `p` is the exponent of a power mean over them. `p=0` is the mean of logs — the historical behaviour and the default.
 
-The fix is to combine the per-stem errors with a power mean instead, exponent `p`. Per-stem gradient energy scales as `mse^(2p-1)`, which is equal across stems at exactly one value — `p = 1/2`, now the default. It is derived, not tuned.
+The one alternative worth knowing about is **`p=0.5`**, which changes how gradient behaves as a stem converges. The gradient blow-up in a log-domain loss comes from the logarithm itself, since the derivative of `log(x)` is `1/x`: measured on a stem converging from -10 dB to -100 dB, the gradient grows about **900×** at `p=0` and stays essentially flat at `p=0.5`. On a stem 60 dB down, the gradient norm is 92.7 against 0.13. That is the mechanism behind issue #5 ("huge gradients when training"), and `p=0.5` is the mitigation.
 
-| `p` | gradient shares, 4 stems over 25 dB | effective stems trained | global gradient norm |
-|---|---|---|---|
-| `0` (pre-1.0.0) | 0.2% / 2.3% / 23.5% / 74.0% | 1.66 of 4 | 3.59 |
-| **`0.5` (new default)** | **25% / 25% / 25% / 25%** | **4.00 of 4** | 0.94 |
-| `1` | 89.8% / 9.0% / 0.9% / 0.3% | 1.23 of 4 | 0.66 |
+It is not the default because it is not free: it changes multi-stem values, so published figures stop being comparable, and on the evidence available its allocation across stems is **worse** for per-stem dB metrics than `p=0` — which won a deterministic effort-allocation comparison in 4 of 4 shapes. `p=0` equalises pressure per unit of *relative* improvement, which is the objective a decibel-domain judge grades against.
 
-`p=1` is in that table because pooling the MSE arithmetically is the obvious alternative and is measurably worse than doing nothing.
+> **Neither value is validated by a real training run.** An A/B on a real separation model is still outstanding, as is a promising third option: `p=0` with a raised gradient floor, which in a preliminary probe preserved `p=0`'s allocation to within 3% while cutting the gradient peak a hundredfold. If either changes the default, that is a major version bump.
 
-This also answers issue #5 ("huge gradients when training"), which is the same effect seen from the other side: as stems converge, log-domain averaging keeps amplifying whatever error is left.
-
-> **`p = 1/2` is derived from gradient analysis, not yet validated by a training run.** An A/B against `p = 0` on a real separation model is in progress. If it moves the default, that is a breaking change and a major version bump.
+> **`p=0.5` does not equalise gradient across stems in general.** Per-stem gradient energy is `G² · mse^(2p−1)`; `p=0.5` cancels only the second factor. `G²` is set by where a stem's error sits in the spectrum, and the weighting filter spans about 35 dB across the audible range — so two stems with identical error in different bands were measured to differ by 316×, at any `p`. An earlier draft of these notes claimed equalisation without that qualifier; the measurement behind it used one waveform at four gains, which is exactly the case where the qualifier does not bite.
 
 ### BREAKING — API
 
 - **`LogWMSE` is the metric and `LogWMSELoss` is the loss.** `return_as_loss` is removed. A flag that silently inverts a training objective is not worth the convenience of one import: forget it when evaluating and your numbers are negated; forget it when training and you minimise quality. `LogWMSELoss` is a real subclass negating at the outermost point, so `loss == -metric` holds for every reduction and for `per_stem` alike.
 - **`audio_length` is removed** and the constructor is keyword-only. The transform size is derived from the input and its weights cached, so one instance serves any length and any stem count. An entire error class goes with it, including the `floor()`-versus-`round()` off-by-one the old length check had to tolerate for callers who sized their segments the ordinary way.
 - **`reduction` covers the batch axis only**, like any other torch loss. `"none"` returns one value per batch item rather than one per `[batch, channel, stem]`, and `"sum"` changes by a factor of channels × stems. Use `per_stem()` for per-element values — and note those are the values that remain comparable with the original numpy implementation at any `p`, so the fidelity anchor is now visible in the API rather than buried in the test suite.
-- **Default `p = 0.5`.** See above.
+- **`p` is new but its default preserves existing behaviour.** See above. Not a breaking change unless you set it.
 - **The `torch_log_wmse_audio_quality` package and distribution are both discontinued.** A shim forwarding a *changed* API is worse than no shim: old code imports cleanly and then behaves differently, which is the failure mode hardest to notice. `import torch_log_wmse_audio_quality` now raises `ImportError`, at the point of the problem. The old distribution stops at 0.3.1 and will not be published again; install `torch-log-wmse` and import `torch_log_wmse`.
 - **The filter no longer follows the input's device.** It is an `nn.Module` holding the impulse response as a non-persistent buffer, so `.to(device)` moves it like anything else and `state_dict()` stays empty — holding one as a submodule adds no checkpoint keys. Previously it reassigned its own tensors mid-forward, which is not thread-safe and is awkward for graph capture.
 - **`calculate_rms` is removed.** It took the square root of a mean square, and at exactly zero `sqrt` has an infinite derivative, so a grad-requiring silent input propagated NaN backwards while the forward value looked finite. The metric now works in the energy domain and never takes a square root, so that failure mode is structurally absent rather than defended against.
+
+### Fixed by a second adversarial audit, of the redesign itself
+
+Four independent agents reviewed the redesigned code, each on a different mandate. All four found something real, in code that had already been verified and carried a 33-mutant gate.
+
+- **Integer audio returned a *perfect* score for any input.** Every tap of the hearing-sensitivity filter has magnitude below 1, so building the weight vector in an integer dtype truncated all 4000 of them to zero — error energy and mixture energy both came out 0, and the score pinned at the `+73.6827` ceiling. Digital silence against a loud target read as flawless. Reachable from `soundfile.read(dtype='int16')` or `scipy.io.wavfile.read`. Integer inputs now raise a `TypeError` naming the conversion, and the weight dtype is forced to floating point independently.
+- **`p >= 6` returned `±inf` in float32, and the failure arrived late.** Raising to the p-th power before the mean underflows: with a bit-exact stem, `EPS**6 = 1e-48` goes to zero, and `log(0)` follows. The loss trained normally and died once the model got *good*, and under `reduction="mean"` one such batch item poisoned the whole batch. Pooling now runs in the log domain via `logsumexp`, verified finite to `p=64`.
+- **The mixture is now detached.** `d(loss)/d(log mixture gain)` was exactly `-8.0`, so anywhere the mixture carried gradient — a cascaded system, learned augmentation — the objective could be reduced by making the *mixture louder* rather than the estimate better.
+- **`calculate_rms` is removed.** It took the square root of a mean square, and at exactly zero `sqrt` has an infinite derivative, so a grad-requiring silent input propagated NaN backwards while the forward value looked finite. The metric now works in the energy domain and never takes a square root, so the failure mode is structurally absent rather than guarded.
+- Smaller: the weight cache survived `.to()`/`.half()` with stale entries; `cache_size=0` raised a bare `StopIteration`; `Resample` ran before validation, so a list or numpy impulse response worked at 44.1 kHz and threw at every other rate.
 
 ### BREAKING — values
 
@@ -226,5 +232,11 @@ Recorded because each looked like a defect and was not, and re-deriving them wou
 
 - **The error-tolerance dead zone is not a training hazard.** (Moot in 1.0.0, which removes the gate entirely — but the analysis is why removing it was known to be safe.) The zero-gradient region is exactly `argmin(loss)` — every point in it attains `-73.682724`, bit-identical to a perfect estimate, and an optimisation started inside it converges to the global minimum with gap `+0.00e+00`. It is also unreachable by 50-70 dB: it needs roughly 74-80 dB SI-SDR, against 5-25 dB for published separation and enhancement. At attainable error levels the threshold is numerically invisible (gradient cosine similarity 1.000000). Replacing the hard threshold with smooth shrinkage would have changed nothing reachable while breaking bit-parity with upstream.
 - **Gradient magnitude is normal for this class of loss.** `‖∇‖ = 8/(√N · rms(F(p−t)))`; the scaling factor cancels, so mixture level is irrelevant. Growing gradients as the estimate improves, and `1/g` scaling under joint gain, are both shared with SI-SDR (measured within ~30% at every operating point).
-- ~~**Per-stem mean-of-logs does not hide a failed stem.**~~ **This conclusion was wrong, and the way it was wrong is worth recording.** It was measured on one totally failed stem against three *perfect* ones, where it holds exactly: the failed stem costs `ceiling/K` = 18.42 units and takes 100% of the gradient energy, because stems with zero error contribute none. But that case is not what training looks like. With four stems at *different partial* levels of convergence — a 25 dB spread, which is ordinary — the worst stem receives **0.2%** of the gradient energy. The test case was unrepresentative in precisely the way that made the aggregation look sound, and finding that is what turned the audit into this redesign. See "Why the aggregation changed" above.
+- **Per-stem mean-of-logs does not hide a failed stem** — upheld, but the reasoning behind it went through two corrections worth recording, because both were instructive.
+
+  The original measurement used one totally failed stem against three *perfect* ones. That case cannot discriminate: stems with zero error contribute no gradient, so every aggregation rule agrees on it. A second measurement with four stems at *different partial* levels of convergence appeared to overturn the conclusion — the largest-error stem received only 0.2% of the gradient energy.
+
+  That reading was itself wrong. Because the error is normalised by the **mixture**, a large error means a **loud** stem, not a badly separated one. Four stems separated to identical quality but at different levels get wildly different gradient shares, and mean-of-logs gives most of it to the *quietest* — the opposite of neglect. What the second measurement actually showed is that mean-of-logs equalises pressure per unit of **relative** improvement, which is a defensible objective and the one a decibel-domain judge grades against.
+
+  Two degenerate test cases in a row, each producing a confident conclusion in a different direction. The lesson that survives is about method, not about aggregation: a case where every hypothesis predicts the same outcome is not evidence for any of them.
 - **44.1 kHz parity with the original numpy implementation is exact** — `0.000e+00` across mono, stereo, independent signals, exact match, all-silence, and tone errors from 60 Hz to 7 kHz, with at most one float32 ULP (1.9e-06) at extreme gains. The shipped `frequency_weighting.png` still matches the shipped filter, and the filter is reproducible from upstream's documented recipe to 1.6e-08.

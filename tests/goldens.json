@@ -75,7 +75,7 @@
     ]
    ]
   ],
-  "pooled": -2.783376
+  "pooled": -2.783283
  },
  "bypass_independent": {
   "grad_norms": null,
@@ -91,7 +91,7 @@
     ]
    ]
   ],
-  "pooled": -2.754902
+  "pooled": -2.754898
  },
  "bypass_level-20": {
   "grad_norms": null,
@@ -123,9 +123,9 @@
  "exact_one_stem": {
   "grad_norms": [
    0.0,
-   0.443049,
-   0.443091,
-   0.442902
+   0.332141,
+   0.332877,
+   0.332445
   ],
   "per_element": [
    [
@@ -143,7 +143,7 @@
     ]
    ]
   ],
-  "pooled": 26.25885
+  "pooled": 36.392815
  },
  "gain0.001": {
   "grad_norms": null,
@@ -159,7 +159,7 @@
     ]
    ]
   ],
-  "pooled": -2.786505
+  "pooled": -2.786479
  },
  "gain1000": {
   "grad_norms": null,
@@ -175,7 +175,7 @@
     ]
    ]
   ],
-  "pooled": -2.786505
+  "pooled": -2.78648
  },
  "graded_stereo_2stem": {
   "grad_norms": null,
@@ -191,14 +191,14 @@
     ]
    ]
   ],
-  "pooled": 17.344995
+  "pooled": 23.028622
  },
  "graded_stereo_4stem": {
   "grad_norms": [
-   0.137715,
-   0.137713,
-   0.137706,
-   0.137677
+   0.437114,
+   0.907783,
+   1.884961,
+   3.911474
   ],
   "per_element": [
    [
@@ -216,7 +216,7 @@
     ]
    ]
   ],
-  "pooled": 16.949364
+  "pooled": 26.008438
  },
  "len22050": {
   "grad_norms": null,
@@ -232,7 +232,7 @@
     ]
    ]
   ],
-  "pooled": -2.781881
+  "pooled": -2.781255
  },
  "len4096": {
   "grad_norms": null,
@@ -248,7 +248,7 @@
     ]
    ]
   ],
-  "pooled": -2.798077
+  "pooled": -2.797588
  },
  "len44100": {
   "grad_norms": null,
@@ -264,7 +264,7 @@
     ]
    ]
   ],
-  "pooled": -2.799046
+  "pooled": -2.798962
  },
  "len62000": {
   "grad_norms": null,
@@ -280,7 +280,7 @@
     ]
    ]
   ],
-  "pooled": -2.787158
+  "pooled": -2.787148
  },
  "level-10": {
   "grad_norms": null,
@@ -505,7 +505,7 @@
     ]
    ]
   ],
-  "pooled": 36.850777
+  "pooled": 36.850796
  },
  "sr48000": {
   "grad_norms": null,
@@ -521,7 +521,7 @@
     ]
    ]
   ],
-  "pooled": -2.753582
+  "pooled": -2.753374
  },
  "stereo_1stem": {
   "grad_norms": null,
@@ -535,7 +535,7 @@
     ]
    ]
   ],
-  "pooled": -2.807944
+  "pooled": -2.807843
  },
  "stereo_2stem": {
   "grad_norms": null,
@@ -551,7 +551,7 @@
     ]
    ]
   ],
-  "pooled": -2.7976
+  "pooled": -2.797536
  },
  "stereo_4stem": {
   "grad_norms": null,
@@ -571,6 +571,6 @@
     ]
    ]
   ],
-  "pooled": -2.800434
+  "pooled": -2.800356
  }
 }

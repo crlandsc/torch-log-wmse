@@ -223,8 +223,8 @@ class TestUnequalChannelsAndStems(unittest.TestCase):
         mean_mse = sum(math.exp(v / -4.0) for v in per_channel) / len(per_channel)
         self.assertGreater(abs(pooled - (-4.0 * math.log(mean_mse))), 1.0)
 
-    def test_p_zero_still_reproduces_upstream_for_unequal_channels(self):
-        """The compatibility path. `p=0` is mean-of-logs, which is exactly what upstream does.
+    def test_the_default_reproduces_upstream_for_unequal_channels(self):
+        """The compatibility promise. The default `p=0` is mean-of-logs, exactly what upstream does.
 
         Residual levels are kept above -50 dB here: below that the removed -68 dB inaudibility gate
         makes upstream and this port diverge for a separate, documented reason, and mixing the two
@@ -234,15 +234,16 @@ class TestUnequalChannelsAndStems(unittest.TestCase):
             with self.subTest(levels=levels):
                 u, p, t = self._case(stems=1, levels=levels)
                 ref = float(_upstream(u, p[:, 0], t[:, 0], SR))
-                got = _torch_metric(u, p[:, 0], t[:, 0], p_exponent=0.0)
+                got = _torch_metric(u, p[:, 0], t[:, 0])
                 self.assertAlmostEqual(got, ref, delta=TOL,
-                                       msg=f"p=0 unequal-channel pooled: {got!r} vs {ref!r}")
+                                       msg=f"default unequal-channel pooled: {got!r} vs {ref!r}")
 
-    def test_the_default_deliberately_diverges_for_unequal_channels(self):
-        """The aggregation change, measured rather than asserted, and in the expected direction.
+    def test_p_one_half_deliberately_diverges_for_unequal_channels(self):
+        """What the `p` knob costs, measured rather than asserted, and in the expected direction.
 
-        This test failed the moment the default moved from 0 to 1/2, which is what it is for. It
-        was written before the change with a note to update it deliberately rather than delete it.
+        Not the default - see above - but the reason `p=0.5` is not the default. Anyone who turns
+        it on for its gradient behaviour gives up comparability with published figures, and this
+        pins how much.
 
         Upstream averages the per-channel LOGS, so one good channel flatters one bad one. The power
         mean at p=1/2 does not, and the gap grows with the spread - which is the entire point:
@@ -259,7 +260,8 @@ class TestUnequalChannelsAndStems(unittest.TestCase):
         for levels, expected in ((((0.1,), (0.01,)), -4.4), (((0.178,), (0.00178,)), -12.9)):
             with self.subTest(levels=levels):
                 u, p, t = self._case(stems=1, levels=levels)
-                divergence = _torch_metric(u, p[:, 0], t[:, 0]) - float(_upstream(u, p[:, 0], t[:, 0], SR))
+                divergence = (_torch_metric(u, p[:, 0], t[:, 0], p_exponent=0.5)
+                              - float(_upstream(u, p[:, 0], t[:, 0], SR)))
                 self.assertAlmostEqual(divergence, expected, delta=0.5,
                                        msg=f"divergence {divergence:.4f}, expected about {expected}")
                 self.assertLess(divergence, previous, "the gap must grow with the spread")

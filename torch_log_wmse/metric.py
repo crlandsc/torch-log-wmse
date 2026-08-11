@@ -213,9 +213,10 @@ class LogWMSE(torch.nn.Module):
     Args:
         sample_rate (int, optional): The sample rate of the audio signal in Hz. Defaults to 44100.
         p (float, optional): Power-mean exponent for pooling across channel and stem. See
-            `pool_mse`. Defaults to 0.5, the unique value at which per-stem gradient energy is
-            equal. Pass `p=0` for the mean-of-logs every version before 1.0.0 computed, which is
-            what published logWMSE figures were produced with.
+            `pool_mse`. Defaults to 0.0, the mean of logs - the same aggregation every version
+            before 1.0.0 used, so multi-stem scores stay comparable with published figures.
+            `p=0.5` bounds the per-stem gradient as a stem converges and is worth trying if
+            gradients grow late in training; see the README on which to use when.
         impulse_response (Tensor, optional): The finite impulse response (FIR) filter for
             frequency weighting. If None (default), use built-in FIR. Currently only supports
             single-channel FIRs (applied to all batches & audio channels).
@@ -229,7 +230,7 @@ class LogWMSE(torch.nn.Module):
             self,
             *,
             sample_rate: int = 44100,
-            p: float = 0.5,
+            p: float = 0.0,
             impulse_response: Optional[Tensor] = None,
             impulse_response_sample_rate: int = 44100,
             bypass_filter: bool = False,

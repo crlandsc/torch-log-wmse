@@ -700,15 +700,29 @@ class TestReductionSemantics(unittest.TestCase):
             torch.allclose(m(u, p, t), m.per_stem(u, p, t).mean(dim=(1, 2)), atol=1e-5),
             "at p=0 the pooled value must be the mean of the per-stem values")
 
-    def test_the_default_p_does_not_pool_as_a_plain_mean(self):
-        """The complement: at p=1/2 the pooled value must DIFFER from the mean of the elements.
+    def test_the_default_pools_as_a_plain_mean(self):
+        """The default is p=0, so the pooled value IS the mean of the per-stem values.
 
-        If these agreed, the default would not have changed anything.
+        This is the compatibility promise: multi-stem scores stay comparable with every version
+        before 1.0.0 and with published logWMSE figures. If it fails, the default has moved.
         """
         u, p, t = self._graded_batch()
         m = _metric(reduction="none")
+        self.assertEqual(m.p, 0.0, "the default p has changed; this test pins the compatibility promise")
+        self.assertTrue(
+            torch.allclose(m(u, p, t), m.per_stem(u, p, t).mean(dim=(1, 2)), atol=1e-5))
+
+    def test_p_one_half_is_available_and_genuinely_different(self):
+        """The knob has to do something, or exposing it is theatre.
+
+        p=1/2 bounds the per-stem gradient as a stem converges, which is why it is offered; the
+        price is that it no longer pools as a plain mean, so its numbers are not comparable with
+        published figures.
+        """
+        u, p, t = self._graded_batch()
+        m = _metric(p=0.5, reduction="none")
         gap = float((m(u, p, t) - m.per_stem(u, p, t).mean(dim=(1, 2))).abs().min())
-        self.assertGreater(gap, 1.0, "the default pooling is indistinguishable from a plain mean")
+        self.assertGreater(gap, 1.0, "p=0.5 is indistinguishable from the default")
 
     def test_per_entry_values_survive_batch_reduction(self):
         # The original suite asserted values only for batch size 1; this pins multi-entry reduction.
