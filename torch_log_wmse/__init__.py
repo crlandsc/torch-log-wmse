@@ -1,3 +1,5 @@
-from .metric import LogWMSE
+from .metric import LogWMSE, LogWMSELoss
 
-__version__ = "0.3.1"
+__all__ = ["LogWMSE", "LogWMSELoss"]
+
+__version__ = "1.0.0"

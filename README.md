@@ -17,34 +17,32 @@ logWMSE is a custom metric and loss function for audio signals that calculates t
 
 ```python
 import torch
-from torch_log_wmse import LogWMSE
+from torch_log_wmse import LogWMSE, LogWMSELoss
 
-# Tensor shapes
-audio_length = 1.0
 sample_rate = 44100
-audio_stems = 4 # 4 audio stems (e.g. vocals, drums, bass, other)
-audio_channels = 2 # stereo
-batch = 4 # batch size
+batch, channels, stems = 4, 2, 4   # e.g. 4 stems: vocals, drums, bass, other
+samples = sample_rate              # 1 second
 
-# Instantiate logWMSE
-# Set `return_as_loss=False` to resturn as a positive metric (Default: True)
-# Set `bypass_filter=True` to bypass frequency weighting (Default: False)
-log_wmse = LogWMSE(
-    audio_length=audio_length,
-    sample_rate=sample_rate,
-    return_as_loss=True, # optional
-    bypass_filter=False, # optional
-)
+# LogWMSE is the metric (higher is better). LogWMSELoss is the same thing negated, for training.
+# One instance handles any length and any number of stems.
+metric = LogWMSE(sample_rate=sample_rate)
 
-# Generate random inputs (scale between -1 and 1)
-audio_lengths_samples = int(audio_length * sample_rate)
-unprocessed_audio = 2 * torch.rand(batch, audio_channels, audio_lengths_samples) - 1
-processed_audio = 2 * torch.rand(batch, audio_channels, audio_stems, audio_lengths_samples) - 1
-target_audio = torch.zeros(batch, audio_channels, audio_stems, audio_lengths_samples)
+unprocessed = 2 * torch.rand(batch, channels, samples) - 1            # the mixture
+processed = unprocessed.unsqueeze(2).expand(-1, -1, stems, -1) * 0.1  # an estimate: 20 dB of residual
+target = torch.zeros(batch, channels, stems, samples)                # a digital-silence target
 
-log_wmse = log_wmse(unprocessed_audio, processed_audio, target_audio)
-print(log_wmse)  # Expected output: approx. -18.42
+print(metric(unprocessed, processed, target))
+# tensor(18.4207)
+
+loss = LogWMSELoss(sample_rate=sample_rate)
+print(loss(unprocessed, processed, target))
+# tensor(-18.4207)
 ```
+
+> **Upgrading from 0.x?** The API changed in 1.0.0. `LogWMSE` is now the positive metric and
+> `LogWMSELoss` is the loss (the old `return_as_loss` flag is gone), `audio_length` is no longer
+> needed, and all arguments are keyword-only. Multi-stem scores are unchanged by default. The
+> [CHANGELOG](CHANGELOG.md) has a full migration guide.
 
 logWMSE accepts three torch tensors of the following shapes:
 - unprocessed_audio: `[batch, audio_channels, samples]`
@@ -64,7 +62,6 @@ The goal of this metric is to account for several factors not present in current
     i.e. (SI-)SDR, SIR, SAR, ISR, VISQOL_audio, STOI, CDPAM, and VISQOL.
 - Overcomes the small value range issue of MSE (i.e. between 1e-8 and 1e-3), making number formatting and sight-reading easier. It is scaled similarly to SI-SDR for consistency with current benchmark metrics (i.e. 3 is poor, 30 is very good).
 - Scale-invariant, aligns with the frequency sensitivity of human hearing.
-- Invariant to the tiny errors of MSE that are inaudible to humans.
 - Logarithmic, reflecting the logarithmic sensitivity of human hearing.
 - Tailored specifically for audio signals.
 
@@ -73,7 +70,7 @@ To measure the frequencies of a signal closer to that of human hearing, the foll
 
 ![Frequency Weighting](https://raw.githubusercontent.com/crlandsc/torch-log-wmse/main/images/frequency_weighting.png)
 
-This metric has been constructed with high-fidelity audio in mind (sample rates &ge; 44.1kHz). It theoretically could work for lower sample rates, like 16kHz, but the metric performs an internal resampling to 44.1kHz for consistency across any input sample rates.
+This metric is built for high-fidelity audio (sample rates &ge; 44.1kHz), and the weighting above is designed at 44.1kHz. It still works at other rates — the weighting filter is resampled to match your audio — but scores at other rates are internally consistent rather than comparable to 44.1kHz. See [how it works](docs/design-and-behavior.md#other-sample-rates) for what changes.
 
 ##### Inputs
 Unlike many audio quality metrics, logWMSE accepts 3 audio inputs rather than 2:
@@ -84,12 +81,26 @@ Unlike many audio quality metrics, logWMSE accepts 3 audio inputs rather than 2:
 
 Typically audio loss functions only use the processed audio and target audio to compare against one another. However, logWMSE requires the initial, unprocessed audio because it needs to be able to measure how well the processed audio was attenuated from the unprocessed version. This adds a factor that accounts for when the input contains silence (digital zero).
 
-This also adds a factor of scale invariance in the sense that the processed audio needs to be scaled appropriately relative to both the unprocessed audio and ground truth. Conceptually, this means that if all 3 inputs are gained by the same arbitrary amount, the metric score will stay the same.
+This also adds a factor of scale invariance: the processed audio needs to be scaled appropriately relative to both the unprocessed audio and the ground truth. Conceptually, if all 3 inputs are gained by the same arbitrary amount, the score stays the same.
+
+##### Using it as a loss
+`LogWMSELoss` is the negated metric, so lower is better and you can minimise it directly. Two things are worth knowing up front:
+
+- The score is **bounded above at +73.6827** — a perfect estimate, or an all-silent triplet, lands there.
+- The **gradient grows as the estimate improves** (the same behaviour as SI-SDR, the opposite of plain MSE), so you should **use gradient clipping**.
+
+A `p` argument controls how per-stem errors combine; its default reproduces the aggregation every earlier version used, so you can ignore it to start. Mixed precision works through `torch.autocast`. The [training guide](docs/training-guide.md) covers all of this in the detail that matters inside a real training loop.
 
 ##### Limitations
-- The metric isn't invariant to arbitrary scaling, polarity inversion, or offsets in the estimated audio relative to the target.
+- **This is a perceptual objective, not a signal-fidelity one.** The weighting deliberately discounts what the ear is less sensitive to, so training against logWMSE will generally cost you SDR relative to an unweighted loss. That is the trade the metric exists to make; if SDR is your target, use an SDR-matched loss.
+- The metric isn't invariant to scaling, polarity inversion, or offsets applied to the estimate alone (as distinct from the joint-gain invariance above).
 - Although it incorporates frequency filtering inspired by human auditory sensitivity, it doesn't fully model human auditory perception. For instance, it doesn't consider auditory masking.
 
+More on these, plus sample-rate behaviour and how to compare scores across models, is in [how it works and behaves](docs/design-and-behavior.md).
+
+## Documentation
+- **[Using logWMSE as a loss](docs/training-guide.md)** — the gradient regime and why it grows, gradient clipping, mixed precision (including Apple Silicon / MPS), and the `p` stem-combining knob.
+- **[How it works and how it behaves](docs/design-and-behavior.md)** — the frequency weighting, the three-input design, scale invariance, other sample rates, and comparing scores.
 
 ## Contributing
 

@@ -1,158 +1,386 @@
+"""Human hearing sensitivity weighting filter.
+
+Derived from nomonosound/log-wmse-audio-quality (Copyright 2023 Nomono), licensed under the
+Apache License 2.0. Modified by Christopher Landschoot (SoundFoxLabs) in 2024-2026: ported from
+numpy to PyTorch; batched [batch, channel, stem, time] tensor API; differentiable loss support; the
+weighted error energy computed in the frequency domain via one-sided Parseval rather than by
+convolving with scipy.signal.oaconvolve; power-mean aggregation across channel and stem in place of
+the mean of logs; the -68 dB per-sample inaudibility gate removed; and the impulse-response and
+silence handling described in README.md and CHANGELOG.md.
+"""
+import hashlib
+import math
+import warnings
+from importlib.resources import files
+from typing import Optional
+
 import torch
 from torch import Tensor
 from torchaudio.transforms import Resample
-import importlib.resources as resources
-import pickle
-import math
-from typing import Optional
+
+# Raw little-endian float32 samples of the bundled hearing-sensitivity FIR. Previously a pickle, which
+# is a code-execution format: `pickle.load` resolves arbitrary dotted global names and calls them, and
+# nothing validated what came back. A flat array needs none of that, and dropping the pickle also
+# removes numpy as a runtime dependency -- it was required only to reconstruct the pickled ndarray, and
+# is not imported anywhere in this package.
+#
+# The bytes are the float32 cast of the original float64 pickle, which is exactly what the old loader
+# produced (verified bitwise equal), so metric values are unchanged.
+_IR_RESOURCE = "filter_ir.f32"
+_IR_TAPS = 4000
+_IR_SHA256 = "bc9950e4f6be2846bf178017a5cca1e5407244d7b255d60de17b882f304998ab"
 
 
-def prepare_impulse_response_fft(impulse_response, fft_size, symmetric_ir=True):
-    """
-    Prepares the FFT of the impulse response for convolution.
-
-    Args:
-    - impulse_response: The impulse response signal, a 1D tensor of shape [kernel_size].
-    - fft_size: The size of FFT to use, typically a power of two that is at least
-                as large as the sum of the signal length and kernel_size minus one.
-    - symmetric_ir: Whether the impulse response is symmetric (used for circular shifting).
-                If True, padding will be symmetric, if False, padding will be to the right.
-                Defaults to True.
-
-    Returns:
-    - A 2D tensor of shape [1, 1, fft_size // 2 + 1] representing the FFT of the impulse
-      response, ready for broadcasting across batches and channels during convolution.
-    """
-    # Pad the impulse response to FFT size (N+M-1)
-    total_padding = fft_size - impulse_response.shape[-1]
-    if symmetric_ir:
-        left_padding = total_padding // 2
-        right_padding = total_padding - left_padding
-    else:
-        left_padding = 0
-        right_padding = total_padding
-    impulse_response = torch.nn.functional.pad(impulse_response, (left_padding, right_padding))
-
-    # Compute the FFT of the impulse response
-    impulse_response_fft = torch.fft.rfft(impulse_response, n=fft_size)
-
-    # Adjust shape for broadcasting across batches, channels, & stems
-    impulse_response_fft = impulse_response_fft.unsqueeze(0).unsqueeze(0)
-
-    return impulse_response_fft
-
-
-def fft_convolve(audio_batch, impulse_response_fft, fft_size):
-    """
-    Performs FFT convolution on a batch of audio signals using a precomputed impulse response FFT.
+def load_bundled_impulse_response(verify: bool = True) -> Tensor:
+    """Load the bundled human-hearing-sensitivity impulse response.
 
     Args:
-    - audio_batch: A batch of time-domain audio signals. 
-                   Expected shape: [batch, channel, signal_length] or [batch, channel, stem, signal_length].
-    - impulse_response_fft: The precomputed FFT of the impulse response (frequency domain), with shape [1, 1, fft_size // 2 + 1].
+        verify: If True (default), check the payload length and SHA-256 against the values pinned
+            above. This is an integrity check against a corrupted or truncated install, not a
+            security boundary -- anyone who can modify the resource can modify this module too. It is
+            worth having because a silently truncated response would still "work": an all-zero or
+            short FIR produces plausible numbers rather than an error.
 
     Returns:
-    - A tensor of convolved audio signals with the same shape as audio_batch.
+        Tensor: 1-D float32 tensor of `_IR_TAPS` samples.
     """
-    # Perform the FFT on the audio batch
-    signal_fft = torch.fft.rfft(audio_batch, n=fft_size)
+    data = files("torch_log_wmse").joinpath(_IR_RESOURCE).read_bytes()
+    if verify:
+        expected_bytes = _IR_TAPS * 4
+        if len(data) != expected_bytes:
+            raise ValueError(
+                f"{_IR_RESOURCE} should be {expected_bytes} bytes ({_IR_TAPS} float32 samples), "
+                f"got {len(data)}. The install looks corrupt."
+            )
+        digest = hashlib.sha256(data).hexdigest()
+        if digest != _IR_SHA256:
+            raise ValueError(
+                f"{_IR_RESOURCE} failed its integrity check: expected sha256 {_IR_SHA256}, got {digest}."
+            )
+    # bytearray() because frombuffer requires a writable buffer; the copy is 16 KB and happens once.
+    return torch.frombuffer(bytearray(data), dtype=torch.float32)
 
-    # Apply the convolution in the frequency domain
-    result_fft = signal_fft * impulse_response_fft
 
-    # Perform the inverse FFT to obtain the convolved signals
-    convolved_audio = torch.fft.irfft(result_fft, n=fft_size)
+# A ~5% geometric ladder. The required transform length is rounded up to a rung before a size is
+# chosen, so nearby input lengths collapse onto the same transform and reuse one cache entry.
+#
+# Do not expect this to restore the coarse bucketing that powers of two gave. Even 2/3/5-smooth
+# values sit 1-2% apart, so a 0.5-1.5 s sweep produces 54 distinct sizes; the ladder brings that to
+# 21, still above torch.compile's default cache_size_limit of 8. Fixed-length input is the supported
+# case and produces exactly ONE entry either way. The ladder costs nothing in accuracy - any L at or
+# above N + M - 1 gives the same linear convolution - and measured faster at 2 s (1.77x vs 1.51x),
+# because 96000 is a friendlier size than 93312.
+_LADDER_STEP = 1.05
 
-    return convolved_audio
 
+def next_fft_friendly_size(n: int) -> int:
+    """Smallest EVEN 2/3/5-smooth integer >= n.
 
-class HumanHearingSensitivityFilter:
+    Mixed-radix FFTs run fast on any product of small primes, while a power of two is smooth but
+    often forces rounding up much further: 1 s at 44.1 kHz needs 48099 samples, which is 48600 as a
+    5-smooth number against 65536 as a power of two, cutting padding waste from 36% to 1%.
+
+    EVEN is a performance choice, not a correctness one. It used to be mandatory because the
+    group-delay correction assumed it; that correction is gone. Parity still matters for the
+    Nyquist weight, which `parseval_weights` handles for both cases.
     """
-    A filter that applies human hearing sensitivity weighting to audio signals.
-    
-    This class implements a frequency weighting filter that mimics human hearing sensitivity. 
-    It uses predefined finite impulse responses (FIR) to simulate how human ears perceive different frequencies.
-    
+    if n <= 2:
+        return 2
+    best = 1 << (n - 1).bit_length()  # next power of two: an upper bound, and even for n >= 2
+    p5 = 1
+    while p5 < best:
+        p35 = p5
+        while p35 < best:
+            m = 2  # >= 2 keeps the result even
+            while m * p35 < n:
+                m *= 2
+            best = min(best, m * p35)
+            p35 *= 3
+        p5 *= 5
+    return best
+
+
+def _quantized_size(required: int) -> int:
+    """Round `required` up the ladder, then to the next FFT-friendly size."""
+    if required <= 2:
+        return 2
+    rung = int(math.ceil(_LADDER_STEP ** math.ceil(math.log(required) / math.log(_LADDER_STEP))))
+    return next_fft_friendly_size(max(rung, required))
+
+
+def _weight_dtype(dtype: torch.dtype) -> torch.dtype:
+    """The dtype the weight vector is built in: floating point, and never below float32.
+
+    Integer dtypes would truncate the sub-unity impulse response to zeros; float16 and bfloat16
+    carry too few mantissa bits for `|H|^2`, which spans about 156 dB across the shipped filter.
+    """
+    return dtype if dtype in (torch.float32, torch.float64) else torch.float32
+
+
+def parseval_weights(impulse_response: Tensor, transform_size: int) -> Tensor:
+    """Per-bin weights `w[f] = |H(f)|^2 * c[f] / L` for one-sided Parseval.
+
+    The metric only ever needs the ENERGY of the frequency-weighted error, and Parseval gives that
+    from the forward transform alone:
+
+        sum_n y[n]^2 = ( |Y[0]|^2 + |Y[-1]|^2 + 2 * sum_{k=1..-2} |Y[k]|^2 ) / L
+
+    so with `Y = X * H` the whole thing collapses to `sum_f |X(f)|^2 * w[f]`. No inverse transform,
+    no group-delay correction, no trim.
+
+    THE DOUBLING AND THE 1/L ARE FOLDED INTO w ON PURPOSE. A naive `sum(|Y|^2) / L` over an rfft
+    half-spectrum undercounts by 2x, which surfaces as a constant offset of exactly 4*ln(2) = 2.7726
+    on every value. Putting the correction here makes that bug impossible at call sites and testable
+    in one isolated unit.
+
+    `c` is 1 at DC, 2 for interior bins, and at the last bin 1 for EVEN L (a real Nyquist bin,
+    counted once) or 2 for odd L (where the last bin is an ordinary conjugate pair).
+
+    The impulse response is zero-padded on the right rather than centre-padded. Centre-padding
+    existed to place the group delay where the correction expected it; with `|H|^2` the filter's
+    phase cannot affect the result at all, so the padding position is now irrelevant.
+
+    NOTE this makes the FILTER's phase irrelevant, not the metric's. The error is `estimate -
+    target`, so a latency offset between the two is still fully penalised.
+    """
+    spectrum = torch.fft.rfft(impulse_response, n=transform_size)
+    weights = spectrum.real**2 + spectrum.imag**2
+    coefficients = torch.full_like(weights, 2.0)
+    coefficients[0] = 1.0
+    if transform_size % 2 == 0:
+        coefficients[-1] = 1.0
+    return weights * coefficients / transform_size
+
+
+class HumanHearingSensitivityFilter(torch.nn.Module):
+    """
+    Human hearing sensitivity weighting, reported as ENERGY rather than as a filtered signal.
+
+    A predefined finite impulse response (FIR) models how the ear's sensitivity varies with
+    frequency. The metric only ever needs the total energy of the weighted signal, and Parseval
+    gives that from the forward transform alone - so the filtered waveform is never materialised.
+    That removes the inverse transform, the group-delay correction and the trim, along with the
+    entire class of alignment bug the audit had already found once in the group-delay handling.
+
+    One instance serves ANY input length. The transform size is derived per call and its weight
+    vector cached, so nothing pins a length at construction.
+
+    An nn.Module, so it honours the standard torch contract: `.to(device)` and `.cuda()` move its
+    tensors. As a plain class they were unreachable by `.to()`, and the forward pass compensated by
+    comparing devices and REASSIGNING module state - not thread-safe, and awkward for torch.compile
+    and graph capture.
+
+    `impulse_response` is registered `persistent=False`: a derived constant, regenerable from the
+    shipped `filter_ir.f32`, so it must not enter `state_dict()`. Any model holding a LogWMSE as a
+    submodule would otherwise gain checkpoint keys and break `load_state_dict(strict=True)` for
+    everyone who saved before.
+
+    The weight cache is a PLAIN DICT and deliberately not a buffer. Non-persistent buffers still
+    appear in `named_buffers()`, which DDP enumerates to build its broadcast list, so a cache that
+    grows lazily and unevenly across ranks would give them divergent buffer lists.
+
     Attributes:
         sample_rate (int): The sample rate of the audio signal.
-        impulse_response (torch.Tensor): The FIR used for filtering.
-        impulse_response_fft (torch.Tensor): The FFT of the impulse response used for efficient convolution.
-        fft_size (int): The size of the FFT used for convolution. Signals will be padded to this size.
-        audio_length_samples (int): The length of the audio signal in samples.
-        symmetric_ir: Whether the impulse response is symmetric (used for circular shifting).
-                    If True, IR will be padded symmetrically, if False, padding will be to the right.
-                    Defaults to True.
+        impulse_response (torch.Tensor): The FIR used for weighting. Non-persistent buffer.
 
     Args:
-        audio_length (int): The length of the audio signal in seconds.
         sample_rate (int, optional): The sample rate of the audio signal in Hz. Defaults to 44100.
         impulse_response (torch.Tensor, optional): The FIR filter for frequency weighting.
         impulse_response_sample_rate (int, optional): The sample rate of the FIR in Hz. Defaults to 44100.
-        symmetric_ir (bool, optional): Whether the impulse response is symmetric (used for circular shifting). Defaults to True.
+        cache_size (int, optional): How many transform sizes to keep weights for. Defaults to 8,
+            which is ample for the fixed-length case that produces exactly one entry.
     """
     def __init__(
             self,
-            audio_length: int = 1,
             sample_rate: int = 44100,
             impulse_response: Optional[torch.Tensor] = None,
             impulse_response_sample_rate: int = 44100,
-            symmetric_ir: bool = True,
+            cache_size: int = 8,
         ):
-        # Load the impulse response if not provided
-        if impulse_response is None:
-            with resources.open_binary("torch_log_wmse", "filter_ir.pkl") as f:
-                impulse_response = torch.tensor(pickle.load(f), dtype=torch.float32)
+        super().__init__()
+        # Validate the rates first: Resample() below would otherwise fail with a less useful error.
+        if sample_rate <= 0:
+            raise ValueError(f"sample_rate must be positive, got {sample_rate}")
+        if impulse_response_sample_rate <= 0:
+            raise ValueError(
+                f"impulse_response_sample_rate must be positive, got {impulse_response_sample_rate}"
+            )
 
-        # Resample the impulse response if necessary
+        if cache_size < 1:
+            raise ValueError(
+                f"cache_size must be at least 1, got {cache_size}. Zero or negative made the "
+                "eviction branch fire on an empty cache and raise a bare StopIteration."
+            )
+
+        # Load the impulse response if not provided.
+        if impulse_response is None:
+            impulse_response = load_bundled_impulse_response()
+        elif isinstance(impulse_response, torch.Tensor) and impulse_response.requires_grad:
+            # A learnable filter is a separate research path, not a supported feature, and it fails
+            # in two silent ways if let through. An nn.Parameter is demoted to a plain tensor by the
+            # as_tensor().squeeze() below - zero parameters, empty state_dict, never optimised or
+            # checkpointed. And a grad-carrying IR poisons the weight cache: the cached weights hold
+            # the first call's graph, so the second backward raises "backward through the graph a
+            # second time" on step two of any fixed-length loop. Reject it rather than corrupt quietly.
+            raise ValueError(
+                "impulse_response must not require grad; a learnable filter is not supported. Pass "
+                "impulse_response.detach() to use its values as a fixed filter."
+            )
+
+        # CONVERT AND VALIDATE BEFORE RESAMPLING, not after. Resample() needs a float32 torch
+        # tensor, so running it first meant a list, a numpy array or a float64 tensor worked
+        # perfectly at 44.1 kHz and died at any other rate with an error naming neither the
+        # impulse response nor the dtype requirement ("'list' object has no attribute
+        # 'is_floating_point'"). Every accepted input type now behaves the same at every rate.
+        #
+        # The checks themselves: without them a wrong-rank impulse response is silently broadcast
+        # against the stem axis instead of raising, and a degenerate one (all zeros, or containing
+        # NaN) corrupts every result - an all-zero IR makes the metric report its "perfect" ceiling
+        # for every input, forever.
+        impulse_response = torch.as_tensor(impulse_response, dtype=torch.float32).squeeze()
+        if impulse_response.ndim != 1:
+            raise ValueError(
+                "impulse_response must be one-dimensional after squeezing singleton dimensions, got "
+                f"shape {tuple(impulse_response.shape)}. Multi-channel FIRs are not supported."
+            )
+        if impulse_response.numel() < 2:
+            raise ValueError(
+                f"impulse_response must have at least 2 taps, got {impulse_response.numel()}."
+            )
+        if not torch.isfinite(impulse_response).all():
+            raise ValueError("impulse_response contains NaN or infinite values.")
+        if not torch.any(impulse_response != 0):
+            raise ValueError(
+                "impulse_response is all zeros, which would make every comparison report a perfect score."
+            )
+
+        # Resample only now, on a validated float32 tensor.
         if impulse_response_sample_rate != sample_rate:
             resampler = Resample(orig_freq=impulse_response_sample_rate, new_freq=sample_rate)
             impulse_response = resampler(impulse_response)
 
-        # Remove any singleton dimensions
-        self.impulse_response = impulse_response.squeeze()
+        # persistent=False: a derived constant, not learned state. See the class docstring.
+        self.register_buffer("impulse_response", impulse_response, persistent=False)
 
-        # Calculate minimum FFT size (N+M-1) - make a power of 2 for FFT efficiency
-        self.audio_length_samples = math.floor(audio_length * sample_rate)
-        min_fft_size = self.audio_length_samples + impulse_response.shape[-1] - 1
-        self.fft_size = 2 ** math.ceil(math.log2(min_fft_size))
+        self.sample_rate = sample_rate
+        self.cache_size = cache_size
+        # Plain dict, never a buffer - see the class docstring on DDP. Keyed on the TRANSFORM SIZE
+        # (not the input length, which several lengths share) plus device and dtype, so a float32
+        # entry can never be handed to a float64 call and silently downgrade its precision.
+        self._weights = {}
 
-        # Compute the FFT of the impulse response (will be padded to fft_size before FFT)
-        self.symmetric_ir = symmetric_ir
-        self.impulse_response_fft = prepare_impulse_response_fft(impulse_response, self.fft_size, symmetric_ir=self.symmetric_ir)
+    def transform_size(self, n_samples: int) -> int:
+        """The transform length used for an input of `n_samples`.
 
-
-    def __call__(self, audio: Tensor) -> Tensor:
+        `>= n + m - 1` is not a performance preference, it is a correctness requirement: Parseval
+        over an L-point DFT gives the energy of the CIRCULAR convolution, so a shorter L silently
+        returns a wrong number. It used to show up as visible time-domain wrap-around; with the
+        inverse transform gone there is nothing to see.
         """
-        Applies the human hearing sensitivity filter to the input audio via frequency domain convolution.
+        return _quantized_size(n_samples + self.impulse_response.shape[-1] - 1)
 
-        NOTE: The original logWMSE metric implementation in numpy used time-domain convolution for
-              single-channel/single-batch/single-stem audio. This torch implementation uses FFT convolution
-              for efficiency. This will result in slightly different outputs due to the different convolution
-              methods.
-        
-        Args: audio (torch.Tensor): A tensor containing the audio signal to be filtered. 
-                                    Expected shape is [batch, channel, stem, time].
-        
-        Returns: torch.Tensor: The filtered audio signal with the same shape as the input.
+    def weights_for(self, n_samples: int, dtype: torch.dtype) -> Tensor:
+        """Cached Parseval weights for this input length, dtype and device.
+
+        Built in the input's dtype so a float32 weight vector is never handed to a float64 signal,
+        which would silently downgrade the computation and the float64 gradcheck with it.
+
+        THE DTYPE IS FORCED TO FLOATING POINT FIRST, and that is not a nicety. Every tap of the
+        hearing-sensitivity impulse response has magnitude below 1, so casting it to an integer
+        dtype truncates all 4000 taps to zero. The weight vector then becomes all zeros, the error
+        and mixture energies both come out 0, and the metric reports its "perfect" ceiling for
+        EVERY input - which is precisely the failure the all-zero guard in `__init__` exists to
+        prevent, recreated after that guard has run. Integer audio is not exotic: it is what
+        `soundfile.read(dtype='int16')` and `scipy.io.wavfile.read` hand you.
         """
-        # Ensure audio has the correct dimensions: [batch, channel, stem, time]
+        dtype = _weight_dtype(dtype)
+        length = self.transform_size(n_samples)
+        key = (length, self.impulse_response.device, dtype)
+        cached = self._weights.get(key)
+        if cached is None:
+            cached = parseval_weights(self.impulse_response.to(dtype), length)
+            if self.cache_size and len(self._weights) >= self.cache_size:
+                # next(iter(...), None) then pop(oldest, None), never next(iter(...)) then
+                # pop(oldest): the cache is mutated during forward, so a second thread can empty the
+                # dict between the lookup and the pop, and check-then-pop then raises StopIteration
+                # or KeyError. Over-evicting by one under a race just rebuilds an entry, so no lock
+                # is needed - only tolerance of a key that has already gone.
+                oldest = next(iter(self._weights), None)  # oldest key; insertion-ordered dict
+                if oldest is not None:
+                    self._weights.pop(oldest, None)
+            self._weights[key] = cached
+        return cached
+
+    def _apply(self, *args, **kwargs):
+        """Drop the cache on any move or recast, and keep the impulse response at float32-or-better.
+
+        `.to()`, `.half()`, `.double()` and `.cuda()` all route through here. Two jobs:
+
+        * Clear the weight cache. Without this a `.half()` after a forward pass leaves
+          float32-derived weights cached under a key that no longer describes them, and the next
+          call silently reuses them.
+        * Refuse to downcast the impulse response below float32. Every tap of the hearing curve has
+          magnitude below 1, so `.half()` flushes more than half of them to exactly zero and
+          bfloat16 mangles the rest. `_weight_dtype` already keeps the derived WEIGHTS at float32;
+          this keeps the IR itself there. Because `super()._apply` casts in place, the values are
+          already lost by the time the result is visible, so the IR is restored from BEFORE the cast
+          rather than upcast afterwards. A `model.half()` that sweeps this loss up as a submodule
+          therefore keeps a valid filter; the supported mixed-precision path is torch.autocast,
+          which never downcasts the module at all. Device and layout changes still apply normally.
+        """
+        self._weights.clear()
+        before = self.impulse_response
+        module = super()._apply(*args, **kwargs)
+        after = self.impulse_response
+        protected = _weight_dtype(after.dtype)
+        if after.dtype != protected:
+            warnings.warn(
+                f"impulse_response kept at {protected} rather than downcast to {after.dtype}: the "
+                "hearing-curve taps underflow in half precision, which would silently corrupt the "
+                "filter. For mixed-precision training wrap the forward pass in torch.autocast, "
+                "which does not downcast the module.",
+                stacklevel=2,
+            )
+            self.impulse_response = before.to(device=after.device, dtype=protected)
+        return module
+
+    def forward(self, audio: Tensor) -> Tensor:
+        """Total energy of the frequency-weighted signal, per [batch, channel, stem].
+
+        NOT the filtered waveform. Nothing downstream needs the samples, only their energy, and
+        computing the energy directly is what removes the inverse transform, the group-delay
+        correction and the trim.
+
+        This is where values differ from a same-window implementation: the result is the energy of
+        the FULL linear convolution, so the filter's ring-in and ring-out at the buffer edges are
+        counted rather than discarded. The difference is negligible for broadband residuals
+        (5e-05 score units at 1 s) and material only for energy right at the buffer edges (about
+        0.77 units for a single non-zero sample at the first or last index, but essentially nil for
+        the same sample in the interior), because only at an edge does a same-window implementation
+        trim part of the transient's ring off the buffer. It is position, not sparsity.
+
+        Args:
+            audio (torch.Tensor): [batch, channel, stem, time].
+
+        Returns:
+            torch.Tensor: [batch, channel, stem].
+        """
         if audio.ndim != 4:
             raise ValueError("Audio input must have dimensions [batch, channel, stem, time].")
 
-        # Move impulse response to audio device if necessary
-        if self.impulse_response_fft.device != audio.device:
-            self.impulse_response_fft = self.impulse_response_fft.to(audio.device)
+        # No device reassignment here. The buffers follow `.to(device)` like any other module's, so
+        # mutating module state during a forward pass is neither needed nor wanted. A device
+        # mismatch now raises torch's standard "Expected all tensors to be on the same device"
+        # instead of being silently papered over.
+        n_samples = audio.shape[-1]
+        length = self.transform_size(n_samples)
+        weights = self.weights_for(n_samples, audio.real.dtype)
 
-        # Pad audio to match padded FFT size (N+M-1)
-        padding = self.fft_size - audio.shape[-1]
-        audio = torch.nn.functional.pad(audio, (0, padding))
-
-        # Apply FFT convolution
-        filtered_audio = fft_convolve(audio, self.impulse_response_fft, self.fft_size)
-
-        # Circularly shift signal to account for symmetric IR time delay
-        if self.symmetric_ir:
-            shift = (self.fft_size - (self.impulse_response.shape[-1] % 2)) // 2 - 1 # added case for odd length IR
-            filtered_audio = torch.roll(filtered_audio, -shift, dims=-1)
-
-        return filtered_audio[..., :self.audio_length_samples]
+        # Flattened to 2-D for the transform, then restored. `rfft(n=length)` zero-pads internally,
+        # and MPS has no native constant-pad above 3 dimensions - it falls back to View Ops and
+        # warns about the performance. A 2-D pad takes the native path on every backend, and the
+        # energy sum collapses the time axis anyway, so the leading shape is just carried across.
+        leading = audio.shape[:-1]
+        spectrum = torch.fft.rfft(audio.reshape(-1, n_samples), n=length)
+        energy = ((spectrum.real**2 + spectrum.imag**2) * weights).sum(dim=-1)
+        return energy.reshape(leading)

@@ -2,36 +2,99 @@ name: Publish Python 🐍 distribution 📦 to PyPI and TestPyPI
 
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        description: "Where to publish"
+        type: choice
+        default: testpypi
+        options: [testpypi, pypi]
 
 jobs:
+  # Never publish something that fails its own tests. The previous workflow had no test gate.
+  test:
+    uses: ./.github/workflows/ci.yml
+
   build:
-    name: Build and publish Python 🐍 distributions 📦 to PyPI and TestPyPI
+    name: Build the distribution
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip build twine
+
+      # torch_log_wmse/__init__.py is the single source of truth. Read it WITHOUT importing, so the
+      # build does not need torch installed.
+      - name: Resolve version
+        id: ver
+        run: |
+          VERSION=$(grep -oE '"[0-9]+\.[0-9]+\.[0-9]+"' torch_log_wmse/__init__.py | head -1 | tr -d '"')
+          test -n "$VERSION" || { echo "could not resolve version"; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building version $VERSION"
+
+      # One distribution as of 1.0.0. The torch_log_wmse_audio_quality shim and the metadata-only
+      # alias distribution are both gone: a shim that forwards a CHANGED API is worse than none,
+      # because old code imports cleanly and then behaves differently.
+      - name: Build torch-log-wmse
+        run: |
+          rm -rf dist build
+          python -m build --outdir dist/main
+
+      - name: Verify the wheel ships what it must and nothing it must not
+        run: |
+          python - <<'PY'
+          import glob, zipfile, sys
+          with zipfile.ZipFile(glob.glob("dist/main/*.whl")[0]) as z:
+              payload = {n for n in z.namelist() if ".dist-info/" not in n}
+          print("payload files:", len(payload))
+          # A stale build/ directory can reintroduce the pickle the project deliberately removed.
+          bad = [n for n in payload if n.endswith((".pkl", ".pickle", ".pt", ".pth"))]
+          if bad:
+              sys.exit(f"FAIL: wheel ships a deserialisation-format resource: {bad}")
+          for required in ("torch_log_wmse/filter_ir.f32", "torch_log_wmse/py.typed"):
+              if required not in payload:
+                  sys.exit(f"FAIL: wheel is missing {required}")
+          # The classic silent failure is a py.typed that exists in the tree but was never packaged,
+          # so the hints stay invisible to type checkers and nothing complains.
+          leftover = sorted(n for n in payload if n.startswith("torch_log_wmse_audio_quality/"))
+          if leftover:
+              sys.exit(f"FAIL: the removed shim is still being packaged: {leftover}")
+          print("OK: filter_ir.f32 and py.typed present, no pickled resources, no legacy shim")
+          PY
+
+      - name: twine check
+        run: python -m twine check dist/main/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to ${{ inputs.target }}
+    needs: build
     runs-on: ubuntu-latest
     environment:
       name: production
-      url: https://pypi.org/p/torch-log-wmse
+      url: ${{ inputs.target == 'pypi' && 'https://pypi.org/p/torch-log-wmse' || 'https://test.pypi.org/p/torch-log-wmse' }}
     permissions:
-      id-token: write  # IMPORTANT: mandatory for trusted publishing
+      id-token: write # trusted publishing; no long-lived API token on a command line
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python 3.8
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.8"
-    - name: Install pypa/build and twine
-      run: |
-        python3 -m pip install build twine --user
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
 
-    - name: Build and publish torch-log-wmse-audio-quality
-      run: |
-        sed -i 's/name = .*/name = torch-log-wmse-audio-quality/' setup.cfg
-        python3 -m build
-        python3 -m twine upload --repository-url https://test.pypi.org/legacy/ -u __token__ -p ${{ secrets.TEST_PYPI_API_KEY }} dist/*
-        python3 -m twine upload --repository-url https://upload.pypi.org/legacy/ -u __token__ -p ${{ secrets.PYPI_API_KEY }} dist/*
-
-    - name: Build and publish torch-log-wmse
-      run: |
-        sed -i 's/name = .*/name = torch-log-wmse/' setup.cfg
-        python3 -m build
-        python3 -m twine upload --repository-url https://test.pypi.org/legacy/ -u __token__ -p ${{ secrets.TEST_PYPI_API_KEY }} dist/*
-        python3 -m twine upload --repository-url https://upload.pypi.org/legacy/ -u __token__ -p ${{ secrets.PYPI_API_KEY }} dist/*
+      # Trusted publishing (OIDC) rather than `-p ${{ secrets.* }}`, so no long-lived API token
+      # ever appears on a command line.
+      - name: Publish torch-log-wmse
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/main/
+          repository-url: ${{ inputs.target == 'pypi' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}

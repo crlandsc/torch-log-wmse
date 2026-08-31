@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # Required so the publish workflow can call this as a reusable workflow for its test gate.
+  # Without it GitHub rejects pypi.yml as invalid and no release job runs at all.
+  workflow_call:
+
+jobs:
+  tests:
+    name: py${{ matrix.python }} / ${{ matrix.numpy }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The package itself no longer depends on numpy at all (the bundled filter is raw float32,
+        # not a pickle), so this is a plain Python-version matrix spanning python_requires >=3.9.
+        # numpy still arrives transitively via the optional parity dependency; the legs below pin it
+        # on one job each so both major versions get exercised by that path.
+        include:
+          - python: "3.9"
+            numpy: "numpy>=1.22,<2"
+          - python: "3.11"
+            numpy: "numpy>=2,<3"
+          - python: "3.12"
+            numpy: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install dependencies
+        env:
+          NUMPY_SPEC: ${{ matrix.numpy }}
+        run: |
+          python -m pip install --upgrade pip wheel
+          # CPU-only torch keeps the runner fast and avoids pulling CUDA wheels.
+          pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
+          if [ -n "$NUMPY_SPEC" ]; then pip install "$NUMPY_SPEC"; fi
+          pip install pytest
+          # Optional reference implementation, so the upstream-parity tests actually run rather
+          # than skipping. It pulls scipy and soxr.
+          pip install log-wmse-audio-quality
+
+      - name: Show resolved versions and assert the numpy pin held
+        env:
+          NUMPY_SPEC: ${{ matrix.numpy }}
+        run: |
+          python -c "import sys; print('python', sys.version)"
+          python -c "import torch, torchaudio; print('torch', torch.__version__, '| torchaudio', torchaudio.__version__)"
+          python - <<'EOF'
+          import os, sys
+          spec = os.environ.get("NUMPY_SPEC", "")
+          import numpy
+          print("numpy", numpy.__version__)
+          if spec:
+              want = 1 if "<2" in spec else 2
+              got = int(numpy.__version__.split(".")[0])
+              if got != want:
+                  sys.exit(f"numpy pin did not hold: wanted major {want}, resolved {numpy.__version__}")
+          EOF
+
+      - name: Run tests
+        run: pytest -q
+
+  # The legs above all install the optional reference implementation, which drags in numpy via scipy.
+  # That masks a whole class of bug: a test module importing something the package itself does not
+  # depend on. A matplotlib import at module scope in tests/test_metric.py broke all three legs at
+  # COLLECTION while passing locally, purely because the dev environment happened to have it. This job
+  # is the guard: torch plus pytest and nothing else, so the suite must run against a bare install of
+  # what it is testing, with the parity module skipping rather than erroring.
+  bare:
+    name: bare (no numpy, no matplotlib, no reference impl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install torch and pytest only
+        run: |
+          python -m pip install --upgrade pip wheel
+          pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
+          pip install pytest
+          # Deterministic bareness: uninstall rather than trust that torch never pulls numpy in
+          # transitively. torch works without numpy (it warns, which is benign).
+          pip uninstall -y numpy matplotlib || true
+      - name: Assert the environment really is bare
+        run: |
+          python - <<'EOF'
+          import importlib.util, sys
+          for mod in ("numpy", "matplotlib", "log_wmse_audio_quality"):
+              if importlib.util.find_spec(mod) is not None:
+                  sys.exit(f"{mod} is importable, so this leg is not testing what it claims")
+          print("bare: numpy, matplotlib, log_wmse_audio_quality all absent")
+          EOF
+      - name: Run tests
+        run: pytest -q -rs
+
+  build:
+    name: build sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build and check
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          # Catches malformed metadata and a broken long_description before it reaches PyPI,
+          # which the publish workflow does not do.
+          python -m twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

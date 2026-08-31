@@ -1,53 +1,44 @@
 import os
 import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# insert(0, ...) not append: with append, a pip-installed copy of this package in
+# site-packages shadows the working tree when this file is run directly
+# (python tests/test_x.py puts tests/ on sys.path[0], not the repo root), so the
+# suite would silently test the installed wheel instead of the code under edit.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import math
 import unittest
 import torch
-import numpy as np
-import matplotlib.pyplot as plt
-from torch_log_wmse import LogWMSE
-from torch_log_wmse.utils import calculate_rms, convert_decibels_to_amplitude_ratio
-from torch_log_wmse.freq_weighting_filter import prepare_impulse_response_fft, HumanHearingSensitivityFilter
-
-# Test alias package
-# from torch_log_wmse_audio_quality import LogWMSE
-# from torch_log_wmse_audio_quality.utils import calculate_rms, convert_decibels_to_amplitude_ratio
-# from torch_log_wmse_audio_quality.freq_weighting_filter import prepare_impulse_response_fft, HumanHearingSensitivityFilter
+# No numpy and no matplotlib at module scope. The package itself needs neither, so requiring them to
+# COLLECT the suite means the suite cannot run in a bare install of what it is testing. matplotlib is
+# imported lazily inside the one plotting block that uses it (disabled by default).
+# conftest owns the sys.path insertion, the thread cap, and every construction of the metric and the
+# filter. Constructing through it is what keeps the 1.0.0 constructor changes to one edit.
+from tests.conftest import CEILING, make_filter, make_loss, make_metric
+from torch_log_wmse.utils import convert_decibels_to_amplitude_ratio
 
 class TestLogWMSELoss(unittest.TestCase):
     def setUp(self):
         pass # Anything shared between tests
 
-    def test_calculate_rms(self):
-        print("Test calculate_rms")
-        for i in range(10):
-            with self.subTest(i=i):
-                torch.manual_seed(i)
-                samples = torch.rand(2, 2, 44100)
-                rms = calculate_rms(samples)
+    def test_per_stem(self):
+        """Replaces a test that reached into a private static with a hand-built input_rms.
 
-                self.assertIsInstance(rms, torch.Tensor)
-                self.assertEqual(rms.shape, (2, 2))
+        `per_stem` is the public way to get the same values, so the test no longer has to
+        reconstruct the metric's internal call signature to check a shape.
+        """
+        print("Test per_stem")
+        metric = make_metric(sample_rate=44100)
+        unprocessed_audio = torch.rand(2, 2, 44100)          # [batch, channel, time]
+        processed_audio = torch.ones(2, 2, 3, 44100)         # [batch, channel, stem, time]
+        target_audio = torch.ones(2, 2, 3, 44100)
 
-                print(f"Test {i}, RMS Value: {rms.mean()}")
-
-    def test_calculate_log_wmse(self):
-        print("Test calculate_log_wmse")
-        log_wmse_loss = LogWMSE(audio_length=1.0, sample_rate=44100)
-        input_rms = torch.ones(2, 2)
-        processed_audio = torch.ones(2, 2, 3, 44100)  # [batch, channel, stem, time]
-        target_audio = torch.ones(2, 2, 3, 44100)  # [batch, channel, stem, time]
-
-        values = log_wmse_loss._calculate_log_wmse(
-            input_rms,
-            log_wmse_loss.filters,
-            processed_audio,
-            target_audio,
-        )
+        values = metric.per_stem(unprocessed_audio, processed_audio, target_audio)
 
         self.assertIsInstance(values, torch.Tensor)
         self.assertEqual(values.shape, (2, 2, 3))  # [batch, channel, stem]
+        # An exact match on every stem, so every element is the ceiling.
+        self.assertTrue(torch.allclose(values, torch.full_like(values, CEILING), atol=1e-3))
 
         print(f"Values: {values}")
 
@@ -60,7 +51,7 @@ class TestLogWMSELoss(unittest.TestCase):
         batch = 4 # batch size
 
         for i, audio_length in enumerate(audio_lengths):
-            log_wmse_loss = LogWMSE(audio_length=audio_length, sample_rate=sample_rate)
+            log_wmse_loss = make_loss(audio_length=audio_length, sample_rate=sample_rate)
             for j in range(3):
                 with self.subTest(i=i, j=j):
                     torch.manual_seed((i+1)*(j+1)) # Ensure reproducibility
@@ -87,7 +78,7 @@ class TestLogWMSELoss(unittest.TestCase):
         batch = 4 # batch size
 
         for i, audio_length in enumerate(audio_lengths):
-            log_wmse_loss = LogWMSE(audio_length=audio_length, sample_rate=sample_rate, bypass_filter=True)
+            log_wmse_loss = make_loss(audio_length=audio_length, sample_rate=sample_rate, bypass_filter=True)
             for j in range(3):
                 with self.subTest(i=i, j=j):
                     torch.manual_seed((i+1)*(j+1)) # Ensure reproducibility
@@ -115,7 +106,7 @@ class TestLogWMSELoss(unittest.TestCase):
         batch = 4 # batch size
 
         for i, audio_length in enumerate(audio_lengths):
-            log_wmse_loss = LogWMSE(audio_length=audio_length, sample_rate=sample_rate)
+            log_wmse_loss = make_loss(audio_length=audio_length, sample_rate=sample_rate)
             for j in range(3):
                 with self.subTest(i=i, j=j):
                     torch.manual_seed((i+1)*(j+1)) # Ensure reproducibility
@@ -140,19 +131,20 @@ class TestLogWMSELoss(unittest.TestCase):
         channels = 2
         stems = 4
         for i, audio_length in enumerate(audio_lengths):
-            log_wmse_loss = LogWMSE(audio_length=audio_length, sample_rate=44100)
+            log_wmse_loss = make_loss(audio_length=audio_length, sample_rate=44100)
             for j in range(3):
                 with self.subTest(i=i, j=j):
                     torch.manual_seed((i+1)*(j+1))  # Ensure reproducibility
-                    np.random.seed((i+1)*(j+1))  # to make the test reproducible
 
-                    # Generate random inputs
+                    # Generate random inputs. torch.rand rather than np.random.rand: same U[0,1)
+                    # float32 draw, and this test only asserts the return type and rank, so the
+                    # generator identity is immaterial.
                     audio_lengths_samples = int(audio_length * 44100)
                     # Create [batch=1, channel=2, time] tensor for unprocessed_audio
-                    unprocessed_audio = torch.from_numpy(np.random.rand(channels, audio_lengths_samples).astype(np.float32))[None, ...]  # [1, 2, time]
+                    unprocessed_audio = torch.rand(channels, audio_lengths_samples)[None, ...]  # [1, 2, time]
                     # Create [batch=1, channel=2, stem=4, time] tensors for processed/target audio
-                    processed_audio = torch.from_numpy(np.random.rand(channels, audio_lengths_samples).astype(np.float32))[None, :, None, :].repeat(1, 1, stems, 1)  # [1, 2, 4, time]
-                    target_audio = torch.from_numpy(np.random.rand(channels, audio_lengths_samples).astype(np.float32))[None, :, None, :].repeat(1, 1, stems, 1)  # [1, 2, 4, time]
+                    processed_audio = torch.rand(channels, audio_lengths_samples)[None, :, None, :].repeat(1, 1, stems, 1)  # [1, 2, 4, time]
+                    target_audio = torch.rand(channels, audio_lengths_samples)[None, :, None, :].repeat(1, 1, stems, 1)  # [1, 2, 4, time]
 
                     loss = log_wmse_loss(unprocessed_audio, processed_audio, target_audio)
 
@@ -162,7 +154,7 @@ class TestLogWMSELoss(unittest.TestCase):
                     print(f"Test {i}, Subtest {j}, Audio Length: {audio_length}, Loss: {loss}, Seed: {(i+1)*(j+1)}")
 
     def test_digital_silence_in_batch(self):
-        loss_function = LogWMSE(audio_length=1, return_as_loss=True)
+        loss_function = make_loss(audio_length=1)
         torch.manual_seed(0)
         # raw: [batch, channel, time]
         raw = torch.randn(2, 1, 44100, dtype=torch.float32)
@@ -195,82 +187,75 @@ class TestLogWMSELoss(unittest.TestCase):
         target_audio = torch.rand(batch, channels, stems, samples)
         
         # Test mean reduction (default)
-        mean_log_wmse = LogWMSE(audio_length=1.0, sample_rate=44100, reduction="mean")
+        mean_log_wmse = make_loss(audio_length=1.0, sample_rate=44100, reduction="mean")
         mean_loss = mean_log_wmse(unprocessed_audio, processed_audio, target_audio)
         self.assertIsInstance(mean_loss, torch.Tensor)
         self.assertEqual(mean_loss.ndim, 0)  # Should be a scalar
         
         # Test sum reduction
-        sum_log_wmse = LogWMSE(audio_length=1.0, sample_rate=44100, reduction="sum")
+        sum_log_wmse = make_loss(audio_length=1.0, sample_rate=44100, reduction="sum")
         sum_loss = sum_log_wmse(unprocessed_audio, processed_audio, target_audio)
         self.assertIsInstance(sum_loss, torch.Tensor)
         self.assertEqual(sum_loss.ndim, 0)  # Should be a scalar
         
         # Test no reduction
-        none_log_wmse = LogWMSE(audio_length=1.0, sample_rate=44100, reduction="none")
+        none_log_wmse = make_loss(audio_length=1.0, sample_rate=44100, reduction="none")
         none_loss = none_log_wmse(unprocessed_audio, processed_audio, target_audio)
         self.assertIsInstance(none_loss, torch.Tensor)
-        self.assertEqual(none_loss.shape, (batch, channels, stems))  # Should preserve dimensions
-        
-        # Verify mathematical relationship between mean and sum
-        # The sum should be approximately batch*channels*stems times the mean
-        expected_factor = batch * channels * stems
-        self.assertAlmostEqual(
-            sum_loss.item() / mean_loss.item(),
-            expected_factor,
-            delta=0.1  # Allow some tolerance for floating point differences
-        )
-        
+        # BREAKING CHANGE, asserted deliberately rather than relaxed. `reduction` now controls the
+        # BATCH axis only, like any other torch loss; channel and stem are pooled first. So "none"
+        # is one value per batch item, not one per [batch, channel, stem]. Use per_stem() for those.
+        self.assertEqual(none_loss.shape, (batch,))
+        self.assertEqual(
+            none_log_wmse.per_stem(unprocessed_audio, processed_audio, target_audio).shape,
+            (batch, channels, stems))
+
+        # And sum/mean is now the BATCH size, where it was batch x channels x stems (12 here).
+        self.assertAlmostEqual(sum_loss.item() / mean_loss.item(), batch, delta=0.1)
+
         print(f"Mean reduction loss: {mean_loss.item()}")
         print(f"Sum reduction loss: {sum_loss.item()}")
         print(f"No reduction loss shape: {none_loss.shape}")
 
 class TestFreqWeightingFilter(unittest.TestCase):
+    """The filter reports weighted ENERGY per [batch, channel, stem], not a filtered waveform.
+
+    The waveform is never materialised: the metric only needs its energy, and Parseval gives that
+    from the forward transform alone. That is what removes the inverse transform, the group-delay
+    correction and the trim.
+
+    The plotting block that used to live here went with the waveform, which also leaves this suite
+    with no matplotlib reference of any kind. `tests/test_invariants.py` carries the behavioural
+    checks - a delta impulse response reproducing the unfiltered score, the one-sided Parseval
+    weights, and the per-size cache.
+    """
+
     def setUp(self):
-        # Example audio data, replace with actual audio loading if needed
-        self.plot_output = False
         self.sample_rate = 44100
         self.audio_length = 3.7516936
-        tone = 440 # sine wave in Hz
-        t = np.arange(0, int(self.audio_length*self.sample_rate)) / self.sample_rate
-        self.audio = torch.tensor(0.5 * np.sin(2 * np.pi * tone * t)) # create sine wave
+        tone = 440  # sine wave in Hz
+        # float64 deliberately: it keeps this test exercising dtype promotion against a float32
+        # impulse response, and the weights being built in the INPUT's dtype rather than the IR's.
+        t = torch.arange(int(self.audio_length * self.sample_rate), dtype=torch.float64) / self.sample_rate
+        self.audio = 0.5 * torch.sin(2 * math.pi * tone * t)
         # Shape to [batch=1, channel=1, stem=1, time]
         self.audio = self.audio[None, None, None, :]
 
-    def test_prepare_impulse_response_fft(self):
-        print("Test prepare_impulse_response_fft")
-        ir = torch.rand(512)  # Example impulse response
-        fft_size = 1024
-        ir_fft = prepare_impulse_response_fft(ir, fft_size)
-        self.assertEqual(ir_fft.shape[-1], fft_size//2+1)
+    def test_returns_energy_per_element(self):
+        energy = make_filter(sample_rate=self.sample_rate)(self.audio)
+        self.assertEqual(energy.shape, self.audio.shape[:-1])  # the time axis is consumed
+        self.assertEqual(energy.dtype, torch.float64)  # follows the input, not the float32 IR
+        self.assertTrue(torch.isfinite(energy).all())
+        self.assertGreater(float(energy), 0.0)
 
-    def test_HumanHearingSensitivityFilter(self):
-        print("Test HumanHearingSensitivityFilter")
-        plot_upper_bound = 500
-        hhs_filter = HumanHearingSensitivityFilter(audio_length=self.audio_length, sample_rate=self.sample_rate)
-        # Add zeros at index 50-100 to demonstrate time alignment
-        self.audio[:, :, :, 50:100] = 0
-        self.audio[:, :, :, 101:125] = 0.5
-        self.audio[:, :, :, 126:150] = -0.5
-        self.audio[:, :, :, 151:200] = 0
-
-        filtered_audio = hhs_filter(self.audio)
-
-        # Plot the first 1000 samples before and after filtering
-        if self.plot_output:
-            fig, axs = plt.subplots(2, 1, figsize=(12, 8))
-            axs[0].plot(self.audio.squeeze()[:plot_upper_bound])
-            axs[0].set_title(f'Original Audio (First {plot_upper_bound} Samples)')
-            axs[0].set_ylim(-1, 1)
-            axs[1].plot(filtered_audio.squeeze()[:plot_upper_bound])
-            axs[1].set_title(f'Filtered Audio (First {plot_upper_bound} Samples)')
-            axs[1].set_ylim(-1, 1)
-            plt.tight_layout()
-            plt.show()
-        else:
-            print("Plotting disabled.")
-
-        self.assertEqual(filtered_audio.shape, self.audio.shape)
+    def test_a_440_hz_tone_is_attenuated_less_than_a_10_khz_one(self):
+        """A shape check on the weighting curve itself: hearing sensitivity peaks in the low kHz,
+        so an equal-amplitude 10 kHz tone must come back with less energy than 440 Hz."""
+        f = make_filter(sample_rate=self.sample_rate)
+        n = self.audio.shape[-1]
+        t = torch.arange(n, dtype=torch.float64) / self.sample_rate
+        high = (0.5 * torch.sin(2 * math.pi * 10000 * t))[None, None, None, :]
+        self.assertGreater(float(f(self.audio)), float(f(high)))
 
 
 if __name__ == "__main__":

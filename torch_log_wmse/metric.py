@@ -1,10 +1,189 @@
+"""The logWMSE metric and loss function.
+
+Derived from nomonosound/log-wmse-audio-quality (Copyright 2023 Nomono), licensed under the
+Apache License 2.0. Modified by Christopher Landschoot (SoundFoxLabs) in 2024-2026: ported from
+numpy to PyTorch; batched [batch, channel, stem, time] tensor API; differentiable loss support; the
+weighted error energy computed in the frequency domain via one-sided Parseval rather than by
+convolving with scipy.signal.oaconvolve; power-mean aggregation across channel and stem in place of
+the mean of logs; the -68 dB per-sample inaudibility gate removed; and the impulse-response and
+silence handling described in README.md and CHANGELOG.md.
+"""
+import math
+
 import torch
 from torch import Tensor
 from typing import Callable, Optional
 
-from torch_log_wmse.constants import ERROR_TOLERANCE_THRESHOLD, SCALER, EPS, RMS_EPS
+from torch_log_wmse.constants import SCALER, EPS, RMS_EPS
 from torch_log_wmse.freq_weighting_filter import HumanHearingSensitivityFilter
-from torch_log_wmse.utils import calculate_rms, apply_reduction
+from torch_log_wmse.utils import VALID_REDUCTIONS, apply_reduction
+
+
+def accumulation_dtype(dtype: torch.dtype) -> torch.dtype:
+    """The dtype energies are summed in: never below float32.
+
+    Energies are squares, so half precision gets strictly worse here than it is for the signal
+    itself - and `RMS_EPS**2 = 1e-16`, the floor that keeps a silent mixture finite, underflows to
+    exactly 0.0 in float16.
+    """
+    return dtype if dtype in (torch.float32, torch.float64) else torch.float32
+
+
+def weighted_energy(
+    signal: Tensor, filters: Callable, bypass_filter: bool = False
+) -> Tensor:
+    """Total energy of `signal` after frequency weighting, per [batch, channel, stem].
+
+    `bypass_filter` takes the time-domain route on purpose rather than filtering with a flat
+    response: it is the only path that works in half precision, because `torch.fft` has no half
+    kernel on CPU or MPS.
+    """
+    if bypass_filter:
+        return signal.to(accumulation_dtype(signal.dtype)).pow(2).sum(dim=-1)
+    return filters(signal)
+
+
+def per_element_mse(
+    input_mean_square: Tensor,
+    filters: Callable,
+    processed_audio: Tensor,
+    target_audio: Tensor,
+    bypass_filter: bool = False,
+) -> Tensor:
+    """The frequency-weighted mean squared error, per [batch, channel, stem].
+
+    This is the quantity everything downstream is a function of, and it is deliberately separate
+    from the log: the two halves change independently. The filtering rewrite replaces how this is
+    computed while leaving the score unchanged, and the pooling change replaces how these values
+    combine while leaving this untouched.
+
+    The floor is `RMS_EPS**2`, not `RMS_EPS`: the clamp applies to a MEAN SQUARE here, where it
+    used to apply to an RMS that was subsequently squared. Getting that wrong scales a silent
+    mixture by 1e4 instead of 1e8. RMS_EPS is a FLOOR rather than an addend, so the scaling stays
+    exactly 1/rms for every non-degenerate input; adding it would bias very quiet mixtures.
+
+    The scaling is FOLDED INTO THE DIVISOR rather than multiplied through the waveform. The filter
+    is linear, so `E(filter(k*d)) == k^2 * E(filter(d))`, and dividing once at the end avoids an
+    O(N) multiply and a full-size temporary.
+
+    Both forms were measured, because dividing afterwards looks like it should be worse
+    conditioned - the transform sees data spread over the input's full dynamic range instead of
+    normalised to unit RMS. It is not. Exact joint-gain invariance holds either way (bit-identical
+    at 2^-10 versus 2^10), the extremes behave identically, and on inputs that are NOT exactly
+    proportional in binary - 1e-3 versus 1e3 - folding in is marginally the more accurate of the
+    two (2.4e-07 against 7.2e-07). The residual difference there is the inputs, not the metric:
+    `u * 1e-3` and `u * 1e3` are not exactly a factor of 1e6 apart in float32.
+
+    Args:
+        input_mean_square (Tensor): Mean square of the (weighted) mixture. Broadcasts against
+            [batch, channel, stem].
+        filters (Callable): The frequency-weighting filter, which returns ENERGY.
+        processed_audio (Tensor): [batch, channel, stem, time].
+        target_audio (Tensor): [batch, channel, stem, time].
+        bypass_filter (bool): Skip the frequency weighting.
+
+    Returns:
+        Tensor: [batch, channel, stem].
+    """
+    differences = processed_audio - target_audio
+    n_samples = differences.shape[-1]
+    energy = weighted_energy(differences, filters, bypass_filter)
+    # DETACHED. The mixture's level is a reference the error is measured against, not something to
+    # optimise. Left attached, it is a gradient path: measured d(loss)/d(log mixture gain) = -8.0
+    # exactly, so whenever `unprocessed_audio` carries gradient - a cascaded system, or learned
+    # augmentation - the objective can be minimised by making the mixture LOUDER instead of the
+    # estimate better. The forward value is unchanged either way.
+    floor = torch.clamp_min(input_mean_square.detach().to(energy.dtype), RMS_EPS**2)
+    return energy / (n_samples * floor)
+
+
+def score_from_mse(mse: Tensor) -> Tensor:
+    """Turn per-element MSE into per-element scores: SCALER * log(mse + EPS).
+
+    Separate from `per_element_mse` because this is the half the aggregation change rewrites, and
+    keeping the log out of the MSE computation is what lets pooling happen between the two.
+
+    Args:
+        mse (Tensor): Per-[batch, channel, stem] mean squared error.
+
+    Returns:
+        Tensor: Per-[batch, channel, stem] scores, higher is better.
+    """
+    # Take the log in at least float32, whatever the input dtype was. EPS = 1e-8 underflows to
+    # exactly 0.0 in float16 (the smallest subnormal is 5.96e-8), so a bit-exact stem used to
+    # give log(0) = -inf and the metric returned +inf - and "mean" then propagated that inf
+    # across the whole batch. bfloat16 does not underflow but carries 8 mantissa bits, which is
+    # not enough to hold mse + EPS apart from mse.
+    #
+    # Upcasting rather than using a per-dtype floor is a deliberate choice: it keeps the ceiling
+    # at SCALER*log(EPS) = +73.6827 in EVERY dtype. A floor of finfo(float16).tiny would move
+    # the fp16 ceiling to +38.8 and silently make fp16 and float32 runs incomparable, which is
+    # a worse failure than the one being fixed because it looks like a valid number.
+    return torch.log(_shifted(mse)) * SCALER
+
+
+def _shifted(mse: Tensor) -> Tensor:
+    """`mse + EPS`, in at least float32. The one place EPS is ever added.
+
+    EPS GOES INSIDE ANY POOLING THAT FOLLOWS, never after it. Adding it to a pooled value instead
+    diverges from the per-element form without bound as a perfect stem's error shrinks - tens of
+    units at the default p = 0 (about 28 for two stems, 65 for eight) - and at
+    p = 1/2 it produces a NaN GRADIENT on a bit-exact stem, because the derivative of sqrt is
+    infinite at zero. That fires on a digitally silent target matched exactly - the package's
+    headline case - and a forward-only test cannot see it, because the value stays finite.
+    """
+    if mse.dtype not in (torch.float32, torch.float64):
+        mse = mse.to(torch.float32)
+    return mse + EPS
+
+
+def pool_mse(mse: Tensor, p: float) -> Tensor:
+    """Pool per-[batch, channel, stem] MSE across CHANNEL and STEM, giving one score per batch item.
+
+        M_p   = (mean over (channel, stem) of (mse + EPS)**p)**(1/p)
+        score = SCALER * log(M_p)
+
+    `p` selects how a spread of per-stem errors combines. Per-stem gradient ENERGY scales as
+    `G_s**2 * mse**(2p - 1)`, where `G_s**2` is set by where a stem's error sits in the spectrum;
+    `p = 1/2` cancels the `mse**(2p - 1)` factor but not `G_s**2`, so it is a derived value rather
+    than a tuned one, but NOT an unconditional equaliser across stems (see the README note on `p`).
+    `p = 0` is the mean of logs, which is what every earlier version computed.
+
+    p = 0 IS SPECIAL-CASED rather than computed as a limit. Writing it as `exp(mean(log(x)))` is
+    mathematically the same but not bit-identical, and landing the machinery at p = 0 against an
+    exact gate is what makes the later default change attributable to itself alone.
+
+    The BATCH axis is deliberately excluded. Batch items are independent samples, so averaging
+    their losses is what makes the objective an expectation over the data; pooling them
+    non-linearly couples examples and breaks both gradient accumulation and DDP equivalence with a
+    single large batch.
+
+    Args:
+        mse (Tensor): [batch, channel, stem].
+        p (float): Power-mean exponent, >= 0.
+
+    Returns:
+        Tensor: [batch].
+    """
+    log_x = torch.log(_shifted(mse))
+    if p == 0.0:
+        return log_x.mean(dim=(1, 2)) * SCALER
+
+    # Computed in the LOG DOMAIN via logsumexp, not as `x.pow(p).mean().pow(1/p)`.
+    #
+    #     log M_p = (1/p) * ( logsumexp(p * log x) - log S )
+    #
+    # The direct form raises to the p-th power BEFORE the mean, and in float32 that overflows and
+    # underflows for perfectly ordinary p. With a bit-exact stem, x = EPS = 1e-8, so x**6 = 1e-48
+    # underflows to exactly 0; the mean is then 0, its p-th root is 0, and log(0) makes the score
+    # +inf. That is not a corner case in training: the loss behaves normally and then dies once the
+    # model gets GOOD, and under reduction="mean" one such batch item poisons the whole batch.
+    # Measured before this change: p=6 returned +inf, p=20 returned a plausible forward value with
+    # a NaN gradient. logsumexp subtracts its own maximum, so the whole safe range widens to any p
+    # the constructor accepts, in float32 as well as float64.
+    flat = log_x.flatten(1)
+    log_mean_pow = torch.logsumexp(p * flat, dim=1) - math.log(flat.shape[1])
+    return (log_mean_pow / p) * SCALER
 
 
 class LogWMSE(torch.nn.Module):
@@ -19,108 +198,186 @@ class LogWMSE(torch.nn.Module):
     * Overcomes the small value range issue of MSE (i.e. between 1e-8 and 1e-3), making number
         formatting and sight-reading easier. Scaled similar to SI-SDR.
     * Scale-invariant, aligns with the frequency sensitivity of human hearing.
-    * Invariant to the tiny errors of MSE that are inaudible to humans.
     * Logarithmic, reflecting the logarithmic sensitivity of human hearing.
     * Tailored specifically for audio signals.
 
+    One instance serves ANY input length and any stem count. The transform size is derived from the
+    input and its weights cached, so nothing is pinned at construction. Note the SAMPLE RATE cannot
+    be inferred the same way - the impulse response is resampled to it - so it stays an argument.
+
+    HIGHER IS BETTER. For training, use `LogWMSELoss`, which is this negated. The two were one
+    class with a `return_as_loss` flag until 1.0.0; a flag that silently inverts a training
+    objective is not worth the convenience of a single import.
+
+    ALL ARGUMENTS ARE KEYWORD-ONLY. `audio_length` used to come first, so a positional call written
+    for an earlier version would otherwise land it on `sample_rate` and quietly build a metric at
+    1 Hz instead of raising.
+
     Args:
-        audio_length (int): The length of the audio signal in seconds.
         sample_rate (int, optional): The sample rate of the audio signal in Hz. Defaults to 44100.
+        p (float, optional): Power-mean exponent for pooling across channel and stem. See
+            `pool_mse`. Defaults to 0.0, the mean of logs - the same aggregation every version
+            before 1.0.0 used, so multi-stem scores stay comparable with published figures.
+            `p=0.5` bounds the per-stem gradient as a stem converges and is worth trying if
+            gradients grow late in training; see the README on which to use when.
         impulse_response (Tensor, optional): The finite impulse response (FIR) filter for
             frequency weighting. If None (default), use built-in FIR. Currently only supports
             single-channel FIRs (applied to all batches & audio channels).
         impulse_response_sample_rate (int, optional): The sample rate of the FIR in Hz. Defaults to 44100.
-        return_as_loss (bool, optional): Whether to return the loss value (i.e. negative of the metric). Defaults to True.
         bypass_filter (bool, optional): Whether to bypass the frequency weighting filter. Defaults to False.
-        reduction (str, optional): The reduction method to apply to the logWMSE values. Defaults to "mean".
+        reduction (str, optional): How to aggregate over the BATCH axis - and only the batch axis,
+            as in any other torch loss. One of "mean" (default), "sum", or "none" for per-item
+            values. Channel and stem are pooled by `p` before this applies.
     """
     def __init__(
             self,
-            audio_length: int,
+            *,
             sample_rate: int = 44100,
+            p: float = 0.0,
             impulse_response: Optional[Tensor] = None,
             impulse_response_sample_rate: int = 44100,
-            return_as_loss: bool = True,
             bypass_filter: bool = False,
             reduction: str = "mean",
+            audio_length: Optional[float] = None,
+            return_as_loss: Optional[bool] = None,
         ):
         super().__init__()
+        # Removed arguments are accepted only to reject them by name. Silently ignoring them would
+        # let a caller believe a length was configured or a sign was chosen when neither happened.
+        if audio_length is not None:
+            raise TypeError(
+                "audio_length was removed in 1.0.0. One instance now serves any input length: the "
+                "transform size is derived per call. Drop the argument."
+            )
+        if return_as_loss is not None:
+            raise TypeError(
+                "return_as_loss was removed in 1.0.0. Use LogWMSE for the metric (higher is "
+                "better) or LogWMSELoss for the loss (lower is better)."
+            )
+
+        p = float(p)
+        if not math.isfinite(p) or p < 0:
+            raise ValueError(f"p must be a finite, non-negative number, got {p!r}")
+        self.p = p
+
+        self.sample_rate = sample_rate
         self.filters = HumanHearingSensitivityFilter(
-            audio_length=audio_length,
             sample_rate=sample_rate,
             impulse_response=impulse_response,
             impulse_response_sample_rate=impulse_response_sample_rate,
         )
-        self.return_as_loss = return_as_loss
         self.bypass_filter = bypass_filter
+        if reduction not in VALID_REDUCTIONS:
+            raise ValueError(f"reduction must be one of {VALID_REDUCTIONS}, got {reduction!r}")
         self.reduction = reduction
-    def forward(self, unprocessed_audio: Tensor, processed_audio: Tensor, target_audio: Tensor):
-        assert unprocessed_audio.ndim == 3 # unprocessed_audio audio shape: [batch, channel, time]
-        assert processed_audio.ndim == 4 # processed_audio audio shape: [batch, channel, stem, time]
-        assert target_audio.ndim == 4 # target_audio audio shape: [batch, channel, stem, time]
-        assert processed_audio.shape == target_audio.shape # processed_audio and target_audio should have the same shape
-        assert processed_audio.shape[-1] == target_audio.shape[-1] == unprocessed_audio.shape[-1] # all should have the same length
 
-        if self.bypass_filter:
-            input_rms = calculate_rms(unprocessed_audio.unsqueeze(2))  # [batch, channel, time] -> [batch, channel, stem=1, time]
-        else:
-            input_rms = calculate_rms(self.filters(unprocessed_audio.unsqueeze(2)))  # [batch, channel, time] -> [batch, channel, stem=1, time]
+    def extra_repr(self) -> str:
+        # sample_rate cannot be inferred from the input the way length now is - the impulse response
+        # is resampled to it - so surface it, or a caller who has just learned that length is
+        # automatic will assume the rate is too.
+        return (f"sample_rate={self.sample_rate}, p={self.p}, reduction={self.reduction!r}"
+                + (", bypass_filter=True" if self.bypass_filter else ""))
 
-        # Calculate the logWMSE
-        values = self._calculate_log_wmse(
-            input_rms,
-            self.filters,
-            processed_audio,
-            target_audio,
-            bypass_filter=self.bypass_filter,
-        )
+    def per_stem(self, unprocessed_audio: Tensor, processed_audio: Tensor,
+                 target_audio: Tensor) -> Tensor:
+        """Per-[batch, channel, stem] scores, unpooled and unreduced.
 
-        # Apply reduction using the utility function
-        reduced_values = apply_reduction(values, self.reduction)
-
-        if self.return_as_loss:
-            return -reduced_values
-        else:
-            return reduced_values
-
-    @staticmethod
-    def _calculate_log_wmse(
-        input_rms: Tensor,
-        filters: Callable,
-        processed_audio: Tensor,
-        target_audio: Tensor,
-        bypass_filter: bool = False,
-    ):
-        """
-        Calculate the logWMSE between the processed audio and target audio.
-
-        Args:
-            input_rms (Tensor): The root mean square of the input audio. Shape: [batch, channel, stem].
-            filters (Callable): A function that applies a filter to the audio (i.e. HumanHearingSensitivityFilter).
-            processed_audio (Tensor): The processed audio tensor. Shape: [batch, channel, stem, time].
-            target_audio (Tensor): The target audio tensor. Shape: [batch, channel, stem, time].
-            bypass_filter (bool, optional): Whether to bypass the frequency weighting filter. Defaults to False.
+        These are the values `forward` pools. They are also the values that stay comparable with
+        the original numpy implementation whatever `p` is, since `p` changes only how they combine
+        - which is why the fidelity anchor is visible in the API rather than buried.
 
         Returns:
-            Tensor: The logWMSE between the processed audio and target audio.
+            Tensor: [batch, channel, stem]. Higher is better.
         """
+        return score_from_mse(self._mse(unprocessed_audio, processed_audio, target_audio))
 
-        # Calculate the scaling factor based on the input RMS
-        scaling_factor = 1 / (input_rms + RMS_EPS)
+    def _mse(self, unprocessed_audio: Tensor, processed_audio: Tensor,
+             target_audio: Tensor) -> Tensor:
+        """Validated per-[batch, channel, stem] MSE. The shared front half of both entry points."""
+        self._validate(unprocessed_audio, processed_audio, target_audio)
 
-        # Add extra dimension(s) to scaling_factor to match the shape of processed_audio and target_audio
-        while scaling_factor.dim() < processed_audio.dim():
-            scaling_factor = scaling_factor.unsqueeze(-1)
-        
-        # Calculate the frequency-weighted differences, ignoring small imperceptible differences
-        # Skip frequency weighting if bypass_filter is True
-        if bypass_filter:
-            differences = (processed_audio * scaling_factor) - (target_audio * scaling_factor)
-        else:
-            differences = filters(processed_audio * scaling_factor) - filters(target_audio * scaling_factor)
-        differences[torch.abs(differences) < ERROR_TOLERANCE_THRESHOLD] = 0.0
+        # Mean square of the weighted mixture, per [batch, channel, stem=1] so it broadcasts.
+        mixture = unprocessed_audio.unsqueeze(2)  # [batch, channel, time] -> [b, c, stem=1, time]
+        input_mean_square = (
+            weighted_energy(mixture, self.filters, self.bypass_filter) / mixture.shape[-1]
+        )
+        return per_element_mse(input_mean_square, self.filters, processed_audio, target_audio,
+                               bypass_filter=self.bypass_filter)
 
-        # Calculate the mean squared differences
-        mean_diff = (differences**2).mean(dim=-1)
+    def forward(self, unprocessed_audio: Tensor, processed_audio: Tensor, target_audio: Tensor) -> Tensor:
+        """The pooled score, reduced over the batch axis. Higher is better."""
+        pooled = pool_mse(self._mse(unprocessed_audio, processed_audio, target_audio), self.p)
+        return apply_reduction(pooled, self.reduction)
 
-        return torch.log(mean_diff + EPS) * SCALER
+    @staticmethod
+    def _validate(unprocessed_audio: Tensor, processed_audio: Tensor, target_audio: Tensor) -> None:
+        # Validation raises rather than asserting: `python -O` strips assert statements, and these
+        # checks are load-bearing. Without the batch/channel checks in particular, a mismatch
+        # BROADCASTS and silently returns a plausible-looking number instead of failing.
+        # Integer audio is rejected rather than promoted. Unnormalised PCM straight from
+        # `soundfile.read(dtype='int16')` or `scipy.io.wavfile.read` is a common mistake, and every
+        # tap of the hearing-sensitivity filter has magnitude below 1 - so an integer dtype used to
+        # truncate the whole filter to zeros and report the "perfect" ceiling for ANY input,
+        # including pure silence against a loud target. `weights_for` now forces a float dtype, so
+        # this is no longer load-bearing, but a metric that silently accepts integer waveforms is
+        # hiding a data-loading bug rather than reporting one.
+        for name, t in (("unprocessed_audio", unprocessed_audio),
+                        ("processed_audio", processed_audio), ("target_audio", target_audio)):
+            if not t.is_floating_point():
+                raise TypeError(
+                    f"{name} must be a floating-point tensor, got {t.dtype}. Convert your audio to "
+                    "float first, e.g. `x.float() / 32768` for int16 PCM. (The metric is "
+                    "scale-invariant, so the divisor only matters for readability.)"
+                )
+        if unprocessed_audio.ndim != 3:
+            raise ValueError(
+                "unprocessed_audio must have shape [batch, channel, time], got "
+                f"{tuple(unprocessed_audio.shape)}"
+            )
+        for name, t in (("processed_audio", processed_audio), ("target_audio", target_audio)):
+            if t.ndim != 4:
+                raise ValueError(
+                    f"{name} must have shape [batch, channel, stem, time], got {tuple(t.shape)}"
+                )
+        if processed_audio.shape != target_audio.shape:
+            raise ValueError(
+                "processed_audio and target_audio must have the same shape, got "
+                f"{tuple(processed_audio.shape)} and {tuple(target_audio.shape)}"
+            )
+        # Batch and channel must agree with unprocessed_audio. These were previously unchecked, so a
+        # mono mixture against stereo stems (or a batch-size mismatch) broadcast silently.
+        if unprocessed_audio.shape[0] != processed_audio.shape[0]:
+            raise ValueError(
+                f"batch size mismatch: unprocessed_audio has {unprocessed_audio.shape[0]}, "
+                f"processed_audio has {processed_audio.shape[0]}"
+            )
+        if unprocessed_audio.shape[1] != processed_audio.shape[1]:
+            raise ValueError(
+                f"channel count mismatch: unprocessed_audio has {unprocessed_audio.shape[1]}, "
+                f"processed_audio has {processed_audio.shape[1]}"
+            )
+        if unprocessed_audio.shape[-1] != processed_audio.shape[-1]:
+            raise ValueError(
+                f"length mismatch: unprocessed_audio has {unprocessed_audio.shape[-1]} samples, "
+                f"processed_audio has {processed_audio.shape[-1]}"
+            )
+        # No length check against a configured audio_length: there is no configured length any more.
+        # The transform size is derived from whatever arrives, so the whole error class - including
+        # the floor()-versus-round() off-by-one it had to tolerate - is gone.
+
+
+class LogWMSELoss(LogWMSE):
+    """logWMSE as a training objective: the negated metric, so LOWER IS BETTER.
+
+    A genuine subclass rather than a flag, and it negates at the OUTERMOST point, so
+    `loss == -metric` holds for every reduction and for `per_stem` alike. Every other argument
+    behaves identically.
+    """
+
+    def forward(self, unprocessed_audio: Tensor, processed_audio: Tensor,
+                target_audio: Tensor) -> Tensor:
+        return -super().forward(unprocessed_audio, processed_audio, target_audio)
+
+    def per_stem(self, unprocessed_audio: Tensor, processed_audio: Tensor,
+                 target_audio: Tensor) -> Tensor:
+        return -super().per_stem(unprocessed_audio, processed_audio, target_audio)

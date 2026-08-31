@@ -1,0 +1,24 @@
+# The sdist is the auditable form of this package, so it carries what is needed to verify and
+# regenerate what the wheel ships -- not only the importable code.
+include LICENSE
+include NOTICE
+include README.md
+include CHANGELOG.md
+include requirements.txt
+include requirements_dev.txt
+include pytest.ini
+
+# The bundled filter's generator. Without it the impulse response is an unverifiable binary blob;
+# with it, anyone holding the sdist can regenerate and compare. See the module docstring for the
+# caveat that regeneration matches to ~1.6e-08 rather than bit-exactly.
+include dev/create_freq_weighting_filter_ir.py
+
+# *.json as well as *.py: tests/goldens.json is the recorded baseline the characterization tests
+# assert against, so a tests-without-goldens sdist ships a suite that cannot run.
+recursive-include tests *.py *.json
+
+# Never ship audit scratch, caches, or build leftovers.
+prune .audit
+prune build
+prune dist
+global-exclude *.py[cod] __pycache__ .DS_Store
