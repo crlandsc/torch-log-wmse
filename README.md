@@ -20,48 +20,29 @@ import torch
 from torch_log_wmse import LogWMSE, LogWMSELoss
 
 sample_rate = 44100
-audio_stems = 4    # 4 audio stems (e.g. vocals, drums, bass, other)
-audio_channels = 2 # stereo
-batch = 4          # batch size
-samples = sample_rate  # 1 second
+batch, channels, stems = 4, 2, 4   # e.g. 4 stems: vocals, drums, bass, other
+samples = sample_rate              # 1 second
 
-# LogWMSE is the METRIC: higher is better. LogWMSELoss is the same thing negated, for training.
-# All arguments are keyword-only, and every one of them is optional.
-metric = LogWMSE(
-    sample_rate=sample_rate,
-    p=0.0,               # the default (mean of logs); how per-stem errors combine, see "Combining stems and channels"
-    bypass_filter=False, # skip the frequency weighting
-    reduction="mean",    # over the BATCH axis: "mean", "sum", or "none"
-)
+# LogWMSE is the metric (higher is better). LogWMSELoss is the same thing negated, for training.
+# One instance handles any length and any number of stems.
+metric = LogWMSE(sample_rate=sample_rate)
 
-# One instance handles any input length and any number of stems.
-unprocessed_audio = 2 * torch.rand(batch, audio_channels, samples) - 1
+unprocessed = 2 * torch.rand(batch, channels, samples) - 1            # the mixture
+processed = unprocessed.unsqueeze(2).expand(-1, -1, stems, -1) * 0.1  # an estimate: 20 dB of residual
+target = torch.zeros(batch, channels, stems, samples)                # a digital-silence target
 
-# The target is digital silence, and the estimate leaves 20 dB of residual leakage.
-# Supporting a digital-silence target is the main thing logWMSE offers over (SI-)SDR.
-processed_audio = unprocessed_audio.unsqueeze(2).expand(-1, -1, audio_stems, -1) * 0.1
-target_audio = torch.zeros(batch, audio_channels, audio_stems, samples)
-
-print(metric(unprocessed_audio, processed_audio, target_audio))
+print(metric(unprocessed, processed, target))
 # tensor(18.4207)
 
-print(metric.per_stem(unprocessed_audio, processed_audio, target_audio).shape)
-# torch.Size([4, 2, 4])  - one score per [batch, channel, stem]
-
 loss = LogWMSELoss(sample_rate=sample_rate)
-print(loss(unprocessed_audio, processed_audio, target_audio))
-# tensor(-18.4207)  - exactly the negated metric, for every reduction
+print(loss(unprocessed, processed, target))
+# tensor(-18.4207)
 ```
 
-The value above is not a sampling artifact. Because the estimate is a fixed multiple of the mixture,
-`mse` is exactly `0.1**2` and the score is exactly `-4*ln(0.01) = 18.4207` for any random draw.
-
-> **Upgrading from 0.x?** 1.0.0 is a breaking release for the API: `LogWMSE` changed sign,
-> `return_as_loss` and `audio_length` are gone, and `reduction` now covers only the batch axis.
-> **Aggregation is unchanged** — the default `p=0` is the same mean-of-logs earlier versions used,
-> so multi-stem scores stay comparable. Values move only slightly, and only from the removed
-> inaudibility gate and the removed window trim. The [CHANGELOG](CHANGELOG.md) has a line-by-line
-> migration guide.
+> **Upgrading from 0.x?** The API changed in 1.0.0. `LogWMSE` is now the positive metric and
+> `LogWMSELoss` is the loss (the old `return_as_loss` flag is gone), `audio_length` is no longer
+> needed, and all arguments are keyword-only. Multi-stem scores are unchanged by default. The
+> [CHANGELOG](CHANGELOG.md) has a full migration guide.
 
 logWMSE accepts three torch tensors of the following shapes:
 - unprocessed_audio: `[batch, audio_channels, samples]`
@@ -89,9 +70,7 @@ To measure the frequencies of a signal closer to that of human hearing, the foll
 
 ![Frequency Weighting](https://raw.githubusercontent.com/crlandsc/torch-log-wmse/main/images/frequency_weighting.png)
 
-This metric has been constructed with high-fidelity audio in mind (sample rates &ge; 44.1kHz), and the frequency weighting above is designed at 44.1kHz.
-
-For other sample rates, the **impulse response is resampled to the audio's rate** rather than the audio being resampled to 44.1kHz. Two consequences are worth knowing. Below 44.1kHz the designed curve is truncated at the new Nyquist, so at 16kHz (Nyquist 8kHz) everything above 8kHz of the weighting — including the 10kHz lowpass corner — no longer exists. And because the original numpy implementation resamples the *audio* to 44.1kHz instead, results agree with it to float32 precision at 44.1kHz but diverge at other rates. At 16kHz the disagreement grows sharply towards Nyquist: about 0.12 units for error at 1kHz, 1.5 units at 7kHz, and **tens of units** in the last few hundred Hz below Nyquist (measured about 42 units at 7.9kHz — there **this** implementation still sees the error while the original does not, because the original resamples the *audio* to 44.1kHz and that resampling filter attenuates a 7.9kHz tone by roughly 49 dB before the metric ever measures it). Treat sub-44.1kHz scores as internally consistent but not comparable to 44.1kHz scores or to the original implementation.
+This metric is built for high-fidelity audio (sample rates &ge; 44.1kHz), and the weighting above is designed at 44.1kHz. It still works at other rates — the weighting filter is resampled to match your audio — but scores at other rates are internally consistent rather than comparable to 44.1kHz. See [how it works](docs/design-and-behavior.md#other-sample-rates) for what changes.
 
 ##### Inputs
 Unlike many audio quality metrics, logWMSE accepts 3 audio inputs rather than 2:
@@ -102,54 +81,26 @@ Unlike many audio quality metrics, logWMSE accepts 3 audio inputs rather than 2:
 
 Typically audio loss functions only use the processed audio and target audio to compare against one another. However, logWMSE requires the initial, unprocessed audio because it needs to be able to measure how well the processed audio was attenuated from the unprocessed version. This adds a factor that accounts for when the input contains silence (digital zero).
 
-This also adds a factor of scale invariance in the sense that the processed audio needs to be scaled appropriately relative to both the unprocessed audio and ground truth. Conceptually, this means that if all 3 inputs are gained by the same arbitrary amount, the metric score will stay the same. (Exactly so, down to a mixture RMS of about 1e-8, below which a floor engages — see Limitations.)
+This also adds a factor of scale invariance: the processed audio needs to be scaled appropriately relative to both the unprocessed audio and the ground truth. Conceptually, if all 3 inputs are gained by the same arbitrary amount, the score stays the same.
 
-Note that this is invariance to **joint** gain, which is a different property from the one in Limitations below. Gaining all three inputs together leaves the score unchanged; scaling **only the estimate** does change it. Unlike SI-SDR, logWMSE does not solve for an optimal estimate scale, so an estimate that is correct apart from a gain error is penalised for that gain error.
+##### Using it as a loss
+`LogWMSELoss` is the negated metric, so lower is better and you can minimise it directly. Two things are worth knowing up front:
 
-##### Combining stems and channels
-A multi-stem model produces one error per stem, and they have to become one number. `p` controls how they combine.
+- The score is **bounded above at +73.6827** — a perfect estimate, or an all-silent triplet, lands there.
+- The **gradient grows as the estimate improves** (the same behaviour as SI-SDR, the opposite of plain MSE), so you should **use gradient clipping**.
 
-**The default is `p=0`, the mean of the per-stem logs — the same aggregation every version before 1.0.0 used.** Multi-stem and stereo scores are therefore unchanged, and stay comparable with previously published logWMSE figures. If you do nothing, nothing about aggregation changes.
-
-`p` is the exponent of a power mean over the per-stem errors. The one alternative worth knowing about is **`p=0.5`**, which changes how gradient behaves as a stem converges:
-
-| | `p=0` (default) | `p=0.5` |
-|---|---|---|
-| aggregation | mean of logs, as in every earlier version | power mean over per-stem error amplitude |
-| gradient on a converging stem | grows steeply (~900× by −70 dB residual, peaks near −80 dB, then falls) | roughly flat |
-| comparable with published figures | yes | no |
-
-**Reach for `p=0.5` if your gradients grow late in training** — that is the failure mode it fixes, and it is a real one. Otherwise leave it alone.
-
-Single-stem mono models are unaffected by `p` entirely: with one value to combine, every setting agrees.
-
-> **Two honest caveats on `p`.** Neither value is validated by a real training run — an A/B on a real separation model is still outstanding. And `p=0.5` does *not* equalise gradient across stems in general: per-stem gradient energy is `G² · mse^(2p−1)`, and `p=0.5` cancels only the second factor. `G²` depends on where a stem's error sits in the spectrum, and the weighting filter spans about 35 dB across the audible range — so two stems with identical error but energy in different bands can differ by hundreds of times whatever `p` you choose.
-
-##### Using logWMSE as a loss
-`LogWMSELoss` is the negated metric, so lower is better and it can be minimised directly. A few properties are worth knowing before training against it:
-
-- **The value is bounded above at +73.6827** (`-4 * ln(EPS)`). An exact match, or an all-silent triplet, saturates there. A score pinned at that ceiling means "no measurable error", not a bug.
-- **Gradient magnitude grows as the estimate improves**, scaling as `1 / (absolute filtered error RMS)`. This is the same behaviour as SI-SDR and the opposite of plain MSE, whose gradient vanishes near the optimum. It comes from the logarithm, not from the aggregation: the derivative of `log(x)` is `1/x`, so any log-domain error measure does this. **Use gradient clipping — and know what it does here.** The gradient is small when the model is untrained and grows as it converges, so clipping at a typical threshold (norm ≈ 1) is inactive at first and then active for most of training; once it engages it renormalises every step to the same magnitude, which effectively turns the loss into a normalised-gradient method. The growth is also not monotone: at `p=0` the gradient rises about 900× from −10 dB to −70 dB of residual, peaks near −80 dB where the error reaches the metric's floor, then falls back — so gradient norm alone does not tell you how converged a stem is. `p=0.5` flattens the whole curve if this becomes a problem. In practice a separation model rarely gets near that peak, so the growth is gentle over the range it actually reaches.
-- **The gradient is not scale-invariant even though the value is.** Gaining all three inputs by `g` leaves the score identical but scales the gradient by `1/g`, so the effective learning rate depends on your audio level while the loss curve gives no indication of it. Normalise your audio. Segment length is a much smaller effect than it looks: the per-sample gradient scales as `1/√n`, but the gradient that actually reaches your model parameters was flat to a few percent across a 16× range of crop lengths on a fully-convolutional model, so cropping barely moves the effective learning rate.
-- **Inputs must be floating point.** Integer PCM straight from `soundfile.read(dtype='int16')` or `scipy.io.wavfile.read` raises a `TypeError` rather than being silently accepted. Convert first, e.g. `x.float() / 32768` — the metric is scale-invariant, so the divisor only affects readability.
-- **`reduction`** controls aggregation over the **batch axis only**, like any other torch loss: `"mean"` (default), `"sum"`, or `"none"` for one value per batch item. For per-stem values use `per_stem()`, which returns `[batch, channel, stem]`.
-- **Move it like any other module.** `LogWMSELoss` is an `nn.Module` holding the impulse response as a non-persistent buffer, so `.to(device)` works and `state_dict()` stays empty — holding one as a submodule adds no checkpoint keys.
-
-##### Performance
-Transform sizes are 2/3/5-smooth ("FFT-friendly"), and the weighted error energy is computed in the frequency domain, so there is no inverse transform. The exact size comes from a ~5% geometric ladder rounded up to fit the input, so nearby lengths share a size and reuse one cache entry rather than each getting its own; one second of stereo 4-stem audio at 44.1 kHz transforms at 48600 points rather than 65536.
-
-Fixed-length input is the supported path: it produces exactly one cache entry and one compiled graph. Variable-length input is correct but pays a small setup cost per new length, and recompiles under `torch.compile` on every new length — `torch.compile` guards on the input tensor shape, so padding to a fixed length (not the transform-size ladder) is what keeps it from recompiling. Pad to a fixed length if you intend to compile.
+A `p` argument controls how per-stem errors combine; its default reproduces the aggregation every earlier version used, so you can ignore it to start. Mixed precision works through `torch.autocast`. The [training guide](docs/training-guide.md) covers all of this in the detail that matters inside a real training loop.
 
 ##### Limitations
-- **This is a perceptual objective, not a signal-fidelity one.** The frequency weighting deliberately discounts what the ear is less sensitive to — about 24 dB down at 30 Hz and 31 dB at 20 kHz, with the whole band below 250 Hz carrying under 1% of the filter's total weight. SDR, uSDR and cSDR apply no such weighting and count every frequency equally, so **training against logWMSE will generally cost you SDR relative to an unweighted loss**, concentrated in the low-frequency stems. That is the trade the metric exists to make. If SDR is your target, use an SDR-matched loss.
-- The metric isn't invariant to scaling, polarity inversion, or offsets applied to the estimated audio alone (as distinct from the joint-gain invariance described above).
-- **Joint-gain invariance holds until the mixture is extremely quiet.** The floor is on the mixture's *weighted* mean square, so the exact threshold depends on spectral content — around a mixture RMS of 1e-8 for broadband signal, a few times higher when it is bass-heavy and lower when it is treble-heavy. Below it the score drifts (order a few units near the threshold, tens of units a decade quieter, pinned at the ceiling by 1e-12), and it is the floor, not precision, so float64 does not help. Normalised audio is nowhere near this; heavily attenuated signal can be.
+- **This is a perceptual objective, not a signal-fidelity one.** The weighting deliberately discounts what the ear is less sensitive to, so training against logWMSE will generally cost you SDR relative to an unweighted loss. That is the trade the metric exists to make; if SDR is your target, use an SDR-matched loss.
+- The metric isn't invariant to scaling, polarity inversion, or offsets applied to the estimate alone (as distinct from the joint-gain invariance above).
 - Although it incorporates frequency filtering inspired by human auditory sensitivity, it doesn't fully model human auditory perception. For instance, it doesn't consider auditory masking.
-- **Stem-count dilution.** Perfect stems inflate the score. A 4-stem and a 16-stem model are not directly comparable.
-- **Per-stem values are the upstream-comparable ones.** `per_stem()` matches the original numpy implementation at 44.1 kHz whatever `p` is. At the default `p=0` the pooled value matches it too; at other `p` it deliberately does not, for unequal stems or channels.
-- Results match the original numpy implementation to float32 precision at 44.1 kHz for broadband errors. At other sample rates the two diverge, because the original resamples the audio to 44.1 kHz while this implementation resamples the impulse response to the audio's rate.
-- **Mixed precision: use `torch.autocast`, not `bypass_filter`.** `bypass_filter` is not a precision switch — it removes the frequency weighting entirely — so it is the wrong tool for half precision. Inside `torch.autocast` the transform takes its inputs in float32 and the filtered path works at both float16 and bfloat16, with the score returned in float32 at negligible cost. What has to hold is that the tensors reaching the transform are float32: in a normal setup the model's estimate is half precision but the targets and mixture stay float32, and `estimate − target` promotes back to float32 for free. On MPS this promotion is *required*, because `torch.fft` has no half kernel there — keep targets and mixture in float32 (in Lightning, `precision="bf16-mixed"`, not `"bf16-true"`). A raw half tensor reaching the transform outside autocast still raises. (CUDA is untested here — no device was available.)
 
+More on these, plus sample-rate behaviour and how to compare scores across models, is in [how it works and behaves](docs/design-and-behavior.md).
+
+## Documentation
+- **[Using logWMSE as a loss](docs/training-guide.md)** — the gradient regime and why it grows, gradient clipping, mixed precision (including Apple Silicon / MPS), and the `p` stem-combining knob.
+- **[How it works and how it behaves](docs/design-and-behavior.md)** — the frequency weighting, the three-input design, scale invariance, other sample rates, and comparing scores.
 
 ## Contributing
 
