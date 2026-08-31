@@ -349,17 +349,20 @@ class TestNoSideEffects(unittest.TestCase):
 
 
 class TestGradientAllocation(unittest.TestCase):
-    """Why the default p is 1/2: it is where per-stem gradient energy comes out equal.
+    """How `p` reshapes per-stem gradient allocation, and the exact boundary of the equal-gradient claim.
 
-    Per-stem gradient energy scales as `mse**(2p - 1)`, so it is equal across stems if and only if
-    `p = 1/2`. That is derived, not tuned, and the measurement below is exact rather than
-    approximate - which is the point of pinning it.
+    Per-stem gradient energy scales as `G_s**2 * mse**(2p - 1)`. On residuals of MATCHED spectrum
+    the `G_s**2` factors are equal, so `p = 1/2` cancels the exponent and every stem gets the same
+    gradient energy - a derived value, not a tuned one, and the measurement below is exact. On
+    residuals of DIFFERING spectrum it does not, which the second test pins so the claim is never
+    overstated again.
 
-    This is the defect the whole redesign exists for. Averaging in the log domain starves the stem
-    that most needs gradient: with four stems spread over 25 dB, the worst gets 0.2% of the
-    gradient energy while the best-converged takes 74%. GitHub issue #5 ("huge gradients when
-    training") is the same effect seen from the other side - as stems converge, the log-domain
-    average keeps amplifying whatever is left.
+    `p = 0` (the mean of logs) is the shipped default and the historically comparable one; `p = 1/2`
+    is offered as the late-training gradient mitigation for issue #5, not as the default. Because
+    the error is normalised by the MIXTURE, the largest-error stem is the LOUDEST, not the one that
+    most needs gradient - so `p = 0` concentrating gradient away from it is a property to
+    characterise, not a defect. These tests pin the allocation each `p` produces; they do not argue
+    that one is correct.
     """
 
     N = 8192
@@ -427,15 +430,17 @@ class TestGradientAllocation(unittest.TestCase):
         shares, _ = self._shares(0.5)
         self.assertAlmostEqual(float(1.0 / shares.pow(2).sum()), 4.0, places=3)
 
-    def test_the_old_default_starves_the_worst_stem(self):
-        """The behaviour being fixed, asserted so the improvement cannot silently regress.
+    def test_p_zero_concentrates_gradient_away_from_the_worst_stem(self):
+        """How `p = 0` (the default) allocates gradient, pinned so a pooling change cannot alter it silently.
 
-        p=0 is still available for comparability with published figures, and it still allocates
-        gradient the way it always did - which is why it is not the default any more.
+        `p = 0` gives the largest-error stem under 1% of the gradient energy. Because error is
+        normalised by the mixture, that stem is the loudest, not the neediest, so this is the
+        allocation's shape rather than a defect; `p = 0.5` spreads it (see the tests above).
         """
         shares, _ = self._shares(0.0)
-        self.assertLess(float(shares[0]), 0.01, "p=0 no longer starves the worst stem; if the "
-                                                "pooling changed, this test is the wrong oracle")
+        self.assertLess(float(shares[0]), 0.01,
+                        "p=0 no longer concentrates gradient away from the worst-error stem; if the "
+                        "pooling changed, this test is the wrong oracle")
         self.assertLess(float(1.0 / shares.pow(2).sum()), 2.0)
 
     def test_p_one_concentrates_worse_than_p_zero(self):
@@ -864,6 +869,24 @@ class TestImpulseResponseValidation(unittest.TestCase):
                 self.assertEqual(f.impulse_response.ndim, 1)
                 self.assertEqual(f.impulse_response.numel(), 4000)
 
+    def test_grad_carrying_ir_is_rejected(self):
+        """A learnable filter is not supported and must fail loudly, not silently.
+
+        Both forms it arrives in are rejected: a plain tensor with requires_grad, and an
+        nn.Parameter (which requires grad by default). Left through, the first poisons the weight
+        cache - the cached weights hold the first call's graph, so the second backward raises - and
+        the second is demoted to a plain tensor by as_tensor().squeeze(), giving zero parameters and
+        an empty state_dict with no warning. Detaching is the documented way to use custom values.
+        """
+        for ir in (torch.rand(4000, requires_grad=True),
+                   torch.nn.Parameter(torch.rand(4000))):
+            with self.subTest(kind=type(ir).__name__):
+                with self.assertRaises(ValueError):
+                    self._build(ir)
+        # The same values, detached, are accepted - rejection is about grad, not the values.
+        self.assertEqual(self._build(torch.rand(4000, requires_grad=True).detach()).impulse_response.numel(),
+                         4000)
+
     def test_valid_ir_still_works_end_to_end(self):
         ir = torch.zeros(999)
         ir[499] = 1.0
@@ -1273,6 +1296,37 @@ class TestModuleContract(unittest.TestCase):
         moved = m.to("meta")
         self.assertEqual(moved.filters.impulse_response.device.type, "meta")
 
+    def test_half_and_bfloat16_do_not_corrupt_the_impulse_response(self):
+        """`.half()` on a PARENT module must not destroy the filter.
+
+        Every tap of the hearing curve has magnitude below 1, so casting the IR to float16 flushes
+        more than half of them to exactly zero and bfloat16 mangles the rest. `_weight_dtype` already
+        keeps the derived WEIGHTS at float32; this keeps the IR itself there too, so a `model.half()`
+        that sweeps the loss up as a submodule leaves the filter intact. The supported
+        mixed-precision path is torch.autocast, which never downcasts the module at all.
+
+        The corruption divides out of a broadband energy ratio, so it is checked at the buffer, not
+        through a score - a functional check would be the degenerate case this project keeps hitting.
+        A device-only move must still apply and must NOT warn; that is covered by the `.to()` tests.
+        """
+        reference = _metric(audio_length=self.N / SR).filters.impulse_response.clone()
+
+        for cast in ("half", "bfloat16"):
+            with self.subTest(cast=cast):
+                class Model(torch.nn.Module):
+                    def __init__(self, n):
+                        super().__init__()
+                        self.loss = _metric(audio_length=n / SR)
+
+                model = Model(self.N)
+                with self.assertWarns(UserWarning):
+                    getattr(model, cast)()
+                ir = model.loss.filters.impulse_response
+                self.assertEqual(ir.dtype, torch.float32,
+                                 f"{cast}() downcast the impulse response to {ir.dtype}")
+                self.assertTrue(torch.equal(ir, reference),
+                                f"{cast}() changed impulse-response values")
+
     def test_forward_does_not_mutate_module_state(self):
         """No device reassignment, and nothing else rebound during the pass.
 
@@ -1465,6 +1519,29 @@ class TestTransformSizing(unittest.TestCase):
         self.assertEqual(survived, {f.transform_size(n) for n in lengths[-3:]},
                          "eviction is not first-in-first-out; the newest entries were discarded")
 
+    def test_eviction_tolerates_a_key_that_vanishes_mid_pop(self):
+        """The cache is mutated inside forward, so eviction must survive a concurrent delete.
+
+        Check-then-pop - `pop(next(iter(d)))` - is not atomic: a second thread can empty the dict
+        between choosing the oldest key and popping it, and the pop then raises KeyError (or the
+        lookup raises StopIteration on an empty dict). It reproduces under threads only with a tiny
+        switch interval, which makes a threaded test flaky, so the exact interleaving is forced
+        deterministically here with a dict that deletes each key as it is yielded. The fixed path
+        uses defaulted pops and must not raise; the old path raised KeyError.
+        """
+        class VanishingDict(dict):
+            def __iter__(self):
+                for k in list(super().__iter__()):
+                    self.pop(k, None)  # vanish before the caller can act on the key
+                    yield k
+
+        f = make_filter(cache_size=1)
+        f(torch.rand(1, 1, 1, 1000))                 # one entry, so the next call evicts
+        f._weights = VanishingDict(f._weights)
+        f(torch.rand(1, 1, 1, 2000))                 # eviction runs against the vanishing dict
+        # The new entry is still cached; no exception was raised reaching this line.
+        self.assertIn(f.transform_size(2000), {key[0] for key in f._weights})
+
     def test_cache_size_is_validated(self):
         for bad in (0, -1):
             with self.subTest(cache_size=bad):
@@ -1509,8 +1586,8 @@ class TestAggregationContract(unittest.TestCase):
     # Both filter paths, both float dtypes the filter supports, and three pooling exponents. float16
     # cannot reach the filtering path at all (no half FFT kernel on CPU or MPS) and is covered
     # separately. p is in the sweep because these properties have to hold for EVERY p - that is what
-    # makes them the contract rather than a description of one setting, and it is what lets the
-    # default move from 0 to 1/2 with the contract already proven at both.
+    # makes them the contract rather than a description of one setting, and it is what lets `p` be
+    # changed from its default of 0 with the contract already proven at 0, 1/2 and 1.
     VARIANTS = [(dt, bp, p)
                 for dt in (torch.float32, torch.float64)
                 for bp in (False, True)
@@ -1596,6 +1673,59 @@ class TestAggregationContract(unittest.TestCase):
                 kw = dict(bypass_filter=bypass, p=power)
                 element = float(per_element(u, p, t, **kw).flatten()[0])
                 self.assertAlmostEqual(float(_metric(**kw)(u, p, t)), element, places=5)
+
+    # Small enough that a power mean is nearly a geometric mean, spread over a decade each step so
+    # the trend is a trend and not two points and a tolerance.
+    SMALL_P = (0.1, 0.01, 0.001)
+
+    def test_the_score_is_continuous_in_p_at_zero(self):
+        """A p that is merely small must land near the p = 0 value, and closer the smaller it gets.
+
+        This is the seam test for pooling. `p = 0` is special-cased rather than computed as a limit,
+        so the two branches meet at a seam, and the power mean being continuous at 0 - its limit
+        there IS the geometric mean - is what says the seam is closed.
+
+        What it catches in practice is EPS placed AFTER pooling rather than before. That misplacement
+        is invisible almost everywhere: with every stem imperfect the two forms agree to ~1e-3 units,
+        and at p >= 1/2 they agree to 0.008 even WITH a perfect stem. It only becomes large as p
+        approaches 0, which is exactly where nothing was looking once the default moved to p = 0 and
+        stopped exercising this branch at all. Measured gap against the p = 0 value at p = 0.01:
+        0.40 units correct, 34.9 with EPS outside the pool - and outside the pool the gap GROWS as p
+        shrinks rather than closing, which is what the monotonic assertion below pins.
+
+        A BIT-EXACT STEM is what makes the property bite, since EPS only matters where mse is
+        exactly 0. Hence the ceiling check first: without it this test would still pass while
+        asserting nothing.
+
+        Deliberately a value test, not a gradient test. The gradient at a bit-exact stem is exactly
+        zero however EPS is placed, because the chain back to the waveform carries a factor of the
+        residual and that residual is zero. Only the VALUE can see this.
+
+        `bypass_filter` is not swept: `_graded` builds each residual as a scaled copy of the mixture,
+        so the weighting cancels between numerator and denominator and both paths return the same
+        numbers to the last bit. The filter has its own tests.
+        """
+        levels = [[0.0, 0.05, 0.01], [0.1, 0.02, 0.003]]
+        for dtype in (torch.float32, torch.float64):
+            with self.subTest(dtype=dtype):
+                u, p, t = self._graded(levels, dtype)
+
+                elements = per_element(u, p, t, p=0.0).flatten()
+                self.assertAlmostEqual(
+                    float(elements.max()), CEILING, places=3,
+                    msg="no stem is bit-exact, so EPS placement is unobservable and this is vacuous")
+
+                base = float(_metric(p=0.0)(u, p, t))
+                gaps = [abs(float(_metric(p=power)(u, p, t)) - base) for power in self.SMALL_P]
+                for (p_hi, gap_hi), (p_lo, gap_lo) in zip(zip(self.SMALL_P, gaps),
+                                                          zip(self.SMALL_P[1:], gaps[1:])):
+                    self.assertLess(gap_lo, gap_hi,
+                                    f"gap to p=0 grew from {gap_hi:.4g} at p={p_hi} to "
+                                    f"{gap_lo:.4g} at p={p_lo}; it must close as p -> 0")
+                # Measured 0.041 here. The bound is loose on purpose - the assertion that discriminates
+                # is the one above; this one only stops the trend from converging to the wrong place.
+                self.assertLess(gaps[-1], 0.5,
+                                f"p={self.SMALL_P[-1]} sits {gaps[-1]:.4g} from the p=0 value")
 
 
 class TestGradientAccumulationEquivalence(unittest.TestCase):

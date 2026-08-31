@@ -10,6 +10,7 @@ silence handling described in README.md and CHANGELOG.md.
 """
 import hashlib
 import math
+import warnings
 from importlib.resources import files
 from typing import Optional
 
@@ -211,9 +212,20 @@ class HumanHearingSensitivityFilter(torch.nn.Module):
                 "eviction branch fire on an empty cache and raise a bare StopIteration."
             )
 
-        # Load the impulse response if not provided
+        # Load the impulse response if not provided.
         if impulse_response is None:
             impulse_response = load_bundled_impulse_response()
+        elif isinstance(impulse_response, torch.Tensor) and impulse_response.requires_grad:
+            # A learnable filter is a separate research path, not a supported feature, and it fails
+            # in two silent ways if let through. An nn.Parameter is demoted to a plain tensor by the
+            # as_tensor().squeeze() below - zero parameters, empty state_dict, never optimised or
+            # checkpointed. And a grad-carrying IR poisons the weight cache: the cached weights hold
+            # the first call's graph, so the second backward raises "backward through the graph a
+            # second time" on step two of any fixed-length loop. Reject it rather than corrupt quietly.
+            raise ValueError(
+                "impulse_response must not require grad; a learnable filter is not supported. Pass "
+                "impulse_response.detach() to use its values as a fixed filter."
+            )
 
         # CONVERT AND VALIDATE BEFORE RESAMPLING, not after. Resample() needs a float32 torch
         # tensor, so running it first meant a list, a numpy array or a float64 tensor worked
@@ -288,19 +300,49 @@ class HumanHearingSensitivityFilter(torch.nn.Module):
         if cached is None:
             cached = parseval_weights(self.impulse_response.to(dtype), length)
             if self.cache_size and len(self._weights) >= self.cache_size:
-                self._weights.pop(next(iter(self._weights)))  # oldest out; insertion-ordered dict
+                # next(iter(...), None) then pop(oldest, None), never next(iter(...)) then
+                # pop(oldest): the cache is mutated during forward, so a second thread can empty the
+                # dict between the lookup and the pop, and check-then-pop then raises StopIteration
+                # or KeyError. Over-evicting by one under a race just rebuilds an entry, so no lock
+                # is needed - only tolerance of a key that has already gone.
+                oldest = next(iter(self._weights), None)  # oldest key; insertion-ordered dict
+                if oldest is not None:
+                    self._weights.pop(oldest, None)
             self._weights[key] = cached
         return cached
 
     def _apply(self, *args, **kwargs):
-        """Drop the cache whenever the module is moved or recast.
+        """Drop the cache on any move or recast, and keep the impulse response at float32-or-better.
 
-        `.to()`, `.half()`, `.double()` and `.cuda()` all route through here. Without this, a
-        `.half()` after a forward pass leaves float32-derived weights cached under a key that no
-        longer describes them, and the next call silently reuses them.
+        `.to()`, `.half()`, `.double()` and `.cuda()` all route through here. Two jobs:
+
+        * Clear the weight cache. Without this a `.half()` after a forward pass leaves
+          float32-derived weights cached under a key that no longer describes them, and the next
+          call silently reuses them.
+        * Refuse to downcast the impulse response below float32. Every tap of the hearing curve has
+          magnitude below 1, so `.half()` flushes more than half of them to exactly zero and
+          bfloat16 mangles the rest. `_weight_dtype` already keeps the derived WEIGHTS at float32;
+          this keeps the IR itself there. Because `super()._apply` casts in place, the values are
+          already lost by the time the result is visible, so the IR is restored from BEFORE the cast
+          rather than upcast afterwards. A `model.half()` that sweeps this loss up as a submodule
+          therefore keeps a valid filter; the supported mixed-precision path is torch.autocast,
+          which never downcasts the module at all. Device and layout changes still apply normally.
         """
         self._weights.clear()
-        return super()._apply(*args, **kwargs)
+        before = self.impulse_response
+        module = super()._apply(*args, **kwargs)
+        after = self.impulse_response
+        protected = _weight_dtype(after.dtype)
+        if after.dtype != protected:
+            warnings.warn(
+                f"impulse_response kept at {protected} rather than downcast to {after.dtype}: the "
+                "hearing-curve taps underflow in half precision, which would silently corrupt the "
+                "filter. For mixed-precision training wrap the forward pass in torch.autocast, "
+                "which does not downcast the module.",
+                stacklevel=2,
+            )
+            self.impulse_response = before.to(device=after.device, dtype=protected)
+        return module
 
     def forward(self, audio: Tensor) -> Tensor:
         """Total energy of the frequency-weighted signal, per [batch, channel, stem].
@@ -312,9 +354,10 @@ class HumanHearingSensitivityFilter(torch.nn.Module):
         This is where values differ from a same-window implementation: the result is the energy of
         the FULL linear convolution, so the filter's ring-in and ring-out at the buffer edges are
         counted rather than discarded. The difference is negligible for broadband residuals
-        (5e-05 score units at 1 s) and material only for very sparse ones (0.775 for a single
-        non-zero sample), because the discarded pre-ring is a fixed fraction of that transient's
-        own energy rather than of the window's.
+        (5e-05 score units at 1 s) and material only for energy right at the buffer edges (about
+        0.77 units for a single non-zero sample at the first or last index, but essentially nil for
+        the same sample in the interior), because only at an edge does a same-window implementation
+        trim part of the transient's ring off the buffer. It is position, not sparsity.
 
         Args:
             audio (torch.Tensor): [batch, channel, stem, time].

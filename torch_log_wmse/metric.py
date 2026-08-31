@@ -126,7 +126,8 @@ def _shifted(mse: Tensor) -> Tensor:
     """`mse + EPS`, in at least float32. The one place EPS is ever added.
 
     EPS GOES INSIDE ANY POOLING THAT FOLLOWS, never after it. Adding it to a pooled value instead
-    diverges from the per-element form by up to 32 units whenever a stem is perfect, and at
+    diverges from the per-element form without bound as a perfect stem's error shrinks - tens of
+    units at the default p = 0 (about 28 for two stems, 65 for eight) - and at
     p = 1/2 it produces a NaN GRADIENT on a bit-exact stem, because the derivative of sqrt is
     infinite at zero. That fires on a digitally silent target matched exactly - the package's
     headline case - and a forward-only test cannot see it, because the value stays finite.
@@ -143,8 +144,10 @@ def pool_mse(mse: Tensor, p: float) -> Tensor:
         score = SCALER * log(M_p)
 
     `p` selects how a spread of per-stem errors combines. Per-stem gradient ENERGY scales as
-    `mse**(2p - 1)`, so it is equal across stems if and only if `p = 1/2` - a derived value rather
-    than a tuned one. `p = 0` is the mean of logs, which is what every earlier version computed.
+    `G_s**2 * mse**(2p - 1)`, where `G_s**2` is set by where a stem's error sits in the spectrum;
+    `p = 1/2` cancels the `mse**(2p - 1)` factor but not `G_s**2`, so it is a derived value rather
+    than a tuned one, but NOT an unconditional equaliser across stems (see the README note on `p`).
+    `p = 0` is the mean of logs, which is what every earlier version computed.
 
     p = 0 IS SPECIAL-CASED rather than computed as a limit. Writing it as `exp(mean(log(x)))` is
     mathematically the same but not bit-identical, and landing the machinery at p = 0 against an
