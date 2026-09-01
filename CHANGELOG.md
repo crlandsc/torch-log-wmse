@@ -241,7 +241,7 @@ Recorded because each looked like a defect and was not, and re-deriving them wou
   Two degenerate test cases in a row, each producing a confident conclusion in a different direction. The lesson that survives is about method, not about aggregation: a case where every hypothesis predicts the same outcome is not evidence for any of them.
 - **44.1 kHz parity with the original numpy implementation is float32-close.** For broadband errors and the exact-match and all-silence cases it is `0.000e+00`, or within a few times float32 epsilon. For pure tones the two now differ by up to about 1.5e-2 at 60 Hz (smaller higher up), because 1.0.0 dropped the window trim the original still applies — a deliberate change, not a regression. The shipped `frequency_weighting.png` still matches the shipped filter, and the filter is reproducible from upstream's documented recipe to 1.6e-08.
 
-## 1.1.0 (unreleased)
+## 1.1.0 (2026-09-01)
 
 ### Added
 
