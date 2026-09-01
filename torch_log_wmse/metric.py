@@ -186,6 +186,24 @@ def pool_mse(mse: Tensor, p: float) -> Tensor:
     return (log_mean_pow / p) * SCALER
 
 
+class _GradScale(torch.autograd.Function):
+    """Identity forward; multiplies the gradient by a constant backward.
+
+    This shrinks the reported gradient magnitude WITHOUT perturbing the loss value. The arithmetic
+    form `s*x + (1 - s)*x.detach()` is only value-preserving to float rounding, which breaks the
+    bit-exact `loss == -metric` invariant; returning `x` unchanged forward keeps the value exact.
+    The gradient is deliberately NOT the true gradient of the value, so gradcheck must use
+    grad_scale=1.0.
+    """
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return x.clone()
+    @staticmethod
+    def backward(ctx, grad):
+        return grad * ctx.scale, None
+
+
 class LogWMSE(torch.nn.Module):
     """
     logWMSE is a custom metric and loss function for audio signals that calculates the logarithm
@@ -228,6 +246,11 @@ class LogWMSE(torch.nn.Module):
         reduction (str, optional): How to aggregate over the BATCH axis - and only the batch axis,
             as in any other torch loss. One of "mean" (default), "sum", or "none" for per-item
             values. Channel and stem are pooled by `p` before this applies.
+        grad_scale (float, optional): Multiplies the gradient by this constant while leaving the
+            score value bit-exact. Defaults to 1.0 (off), for both the metric and the loss. A
+            constant scale cancels under Adam and other adaptive optimizers, so it only shrinks the
+            reported gradient magnitude - handy to stop gradient clipping from over-clipping; under
+            plain SGD it is a learning-rate rescale.
     """
     def __init__(
             self,
@@ -238,6 +261,7 @@ class LogWMSE(torch.nn.Module):
             impulse_response_sample_rate: int = 44100,
             bypass_filter: bool = False,
             reduction: str = "mean",
+            grad_scale: float = 1.0,
             audio_length: Optional[float] = None,
             return_as_loss: Optional[bool] = None,
         ):
@@ -270,6 +294,13 @@ class LogWMSE(torch.nn.Module):
         if reduction not in VALID_REDUCTIONS:
             raise ValueError(f"reduction must be one of {VALID_REDUCTIONS}, got {reduction!r}")
         self.reduction = reduction
+        # grad_scale multiplies the gradient by a constant while leaving the forward value
+        # unchanged (see _scale_grad). Invariant under Adam/adaptive optimizers; an lr rescale
+        # under plain SGD. Defaults to 1.0 (off) for both the metric and the loss; users opt in.
+        grad_scale = float(grad_scale)
+        if not math.isfinite(grad_scale) or grad_scale <= 0:
+            raise ValueError(f"grad_scale must be a finite positive number, got {grad_scale!r}")
+        self.grad_scale = grad_scale
 
     def extra_repr(self) -> str:
         # sample_rate cannot be inferred from the input the way length now is - the impulse response
@@ -289,7 +320,7 @@ class LogWMSE(torch.nn.Module):
         Returns:
             Tensor: [batch, channel, stem]. Higher is better.
         """
-        return score_from_mse(self._mse(unprocessed_audio, processed_audio, target_audio))
+        return self._scale_grad(score_from_mse(self._mse(unprocessed_audio, processed_audio, target_audio)))
 
     def _mse(self, unprocessed_audio: Tensor, processed_audio: Tensor,
              target_audio: Tensor) -> Tensor:
@@ -304,10 +335,22 @@ class LogWMSE(torch.nn.Module):
         return per_element_mse(input_mean_square, self.filters, processed_audio, target_audio,
                                bypass_filter=self.bypass_filter)
 
+    def _scale_grad(self, x: Tensor) -> Tensor:
+        """Multiply the gradient of `x` by `self.grad_scale`, leaving its VALUE bit-exact.
+
+        Uses an autograd Function (identity forward, scaled backward), so the reported score/loss
+        is untouched to the bit while every upstream gradient is multiplied by `s`. A constant `s`
+        cancels under Adam and other adaptive optimizers (divides out of `m / sqrt(v)`), so this
+        changes NOTHING about training there; it only shrinks the reported gradient magnitude so a
+        default gradient-clip threshold behaves. Under plain SGD it is exactly an lr rescale.
+        """
+        s = self.grad_scale
+        return x if s == 1.0 else _GradScale.apply(x, s)
+
     def forward(self, unprocessed_audio: Tensor, processed_audio: Tensor, target_audio: Tensor) -> Tensor:
         """The pooled score, reduced over the batch axis. Higher is better."""
         pooled = pool_mse(self._mse(unprocessed_audio, processed_audio, target_audio), self.p)
-        return apply_reduction(pooled, self.reduction)
+        return self._scale_grad(apply_reduction(pooled, self.reduction))
 
     @staticmethod
     def _validate(unprocessed_audio: Tensor, processed_audio: Tensor, target_audio: Tensor) -> None:

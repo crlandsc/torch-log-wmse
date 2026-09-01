@@ -21,7 +21,7 @@ The practical consequence is that gradients can get large late in training, so y
 
 In practice, separation is hard enough that a model rarely converges far enough to reach that peak, so for most training runs you are on the gentle, well-behaved part of the curve. This is the same reason SNR-style losses do not blow up in practice even though they can in theory.
 
-If late-training gradient growth does become a problem, the `p` knob below can flatten it.
+If the gradient magnitude is large enough that clipping over-clips, you have two dials. `grad_scale` (off by default) shrinks the reported gradient without touching the loss value, so the clip stops biting so hard — it cancels under Adam and is a learning-rate rescale under plain SGD. The `p` knob below can also flatten the growth across stems. Either way, watch the actual gradient magnitude so you are not clipping blind.
 
 ## Combining stems: the `p` knob
 

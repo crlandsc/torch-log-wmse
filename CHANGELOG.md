@@ -110,7 +110,7 @@ Updated README to reflect 0.2.8 `bypass_filter` update.
 - Version now only needs to be updated in one location (`torch_log_wmse/__init__.py`)
 - `setup.cfg` now references version via `attr: torch_log_wmse.__version__`
 - `torch_log_wmse_audio_quality` inherits version through import
-## 1.0.0 (unreleased)
+## 1.0.0 (2026-08-31)
 
 A full adversarial audit of the library against its upstream, `nomonosound/log-wmse-audio-quality`, followed by a redesign of the API and the internals, and then a second adversarial audit of that redesign.
 
@@ -240,3 +240,9 @@ Recorded because each looked like a defect and was not, and re-deriving them wou
 
   Two degenerate test cases in a row, each producing a confident conclusion in a different direction. The lesson that survives is about method, not about aggregation: a case where every hypothesis predicts the same outcome is not evidence for any of them.
 - **44.1 kHz parity with the original numpy implementation is float32-close.** For broadband errors and the exact-match and all-silence cases it is `0.000e+00`, or within a few times float32 epsilon. For pure tones the two now differ by up to about 1.5e-2 at 60 Hz (smaller higher up), because 1.0.0 dropped the window trim the original still applies — a deliberate change, not a regression. The shipped `frequency_weighting.png` still matches the shipped filter, and the filter is reproducible from upstream's documented recipe to 1.6e-08.
+
+## 1.1.0 (2026-09-01)
+
+### Added
+
+- **`grad_scale` parameter** on `LogWMSE` and `LogWMSELoss` (default `1.0`, off). It multiplies the gradient magnitude by a constant while leaving the score value bit-exact, so you can shrink the reported gradient to keep gradient clipping from over-clipping. The constant cancels under Adam and other adaptive optimizers, so it changes nothing about training there; under plain SGD it is a learning-rate rescale. logWMSE's gradient grows as the estimate improves, so watch the gradient magnitude when you clip — loosen the clip threshold or lower `grad_scale`.

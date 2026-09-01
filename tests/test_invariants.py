@@ -790,7 +790,10 @@ class TestGradients(unittest.TestCase):
         n = 256
         # audio_length must be consistent with sample_rate, or the length validation rejects the input.
         sr = 4096
-        m = _metric(audio_length=n / sr, sample_rate=sr, return_as_loss=True)
+        # grad_scale must be 1.0 here: the feature deliberately decouples the gradient from the
+        # value (identity forward, scaled backward), which is exactly what gradcheck is built to
+        # catch. It is off by default, but pin it so a future default change cannot break this.
+        m = _metric(audio_length=n / sr, sample_rate=sr, return_as_loss=True, grad_scale=1.0)
         u = (torch.rand(1, 1, n, dtype=torch.float64) * 2 - 1)
         t = (torch.rand(1, 1, 1, n, dtype=torch.float64) * 2 - 1)
         p = (torch.rand(1, 1, 1, n, dtype=torch.float64) * 2 - 1).requires_grad_(True)
@@ -1888,6 +1891,58 @@ class TestLowPrecisionDtypes(unittest.TestCase):
                     p = p.detach().requires_grad_(True)
                     m(u, p, t).backward()
                     self.assertTrue(torch.isfinite(p.grad).all(), f"{dtype} p={p_exponent}: {p.grad}")
+
+
+class TestGradScale(unittest.TestCase):
+    """`grad_scale` multiplies the gradient by a constant, leaving the value bit-exact.
+
+    Off by default (1.0) for both the metric and the loss; a user knob to shrink the reported
+    gradient so a gradient-clip threshold does not over-clip. See metric.py `_scale_grad`.
+    """
+
+    def _triplet(self, n=2048):
+        torch.manual_seed(0)
+        u = torch.rand(1, 1, n) * 2 - 1
+        t = (torch.rand(1, 1, 1, n) * 2 - 1) * 0.3
+        p = t + torch.randn_like(t) * 0.05
+        return u, t, p
+
+    def test_default_is_off_for_metric_and_loss(self):
+        self.assertEqual(_metric().grad_scale, 1.0)
+        self.assertEqual(_metric(return_as_loss=True).grad_scale, 1.0)
+
+    def test_value_is_bit_exact_across_grad_scale(self):
+        u, t, p = self._triplet()
+        for as_loss in (False, True):
+            for reduction in ("mean", "sum", "none"):
+                with self.subTest(as_loss=as_loss, reduction=reduction):
+                    off = _metric(return_as_loss=as_loss, reduction=reduction, grad_scale=1.0)(u, p, t)
+                    on = _metric(return_as_loss=as_loss, reduction=reduction, grad_scale=0.01)(u, p, t)
+                    self.assertTrue(torch.equal(off, on), "grad_scale must not change the value")
+
+    def test_gradient_scales_by_the_constant(self):
+        u, t, p = self._triplet()
+        for s in (0.01, 0.1, 4.0):
+            with self.subTest(grad_scale=s):
+                p1 = p.detach().requires_grad_(True)
+                _metric(return_as_loss=True, grad_scale=1.0)(u, p1, t).backward()
+                p2 = p.detach().requires_grad_(True)
+                _metric(return_as_loss=True, grad_scale=s)(u, p2, t).backward()
+                ratio = float(p2.grad.norm() / p1.grad.norm())
+                self.assertAlmostEqual(ratio, s, places=5, msg=f"norm ratio {ratio} != {s}")
+                self.assertTrue(torch.allclose(p2.grad, s * p1.grad, rtol=1e-4, atol=1e-8))
+
+    def test_loss_stays_negated_metric_under_grad_scale(self):
+        u, t, p = self._triplet()
+        metric = _metric(grad_scale=0.1)(u, p, t)
+        loss = _metric(return_as_loss=True, grad_scale=0.1)(u, p, t)
+        self.assertEqual(loss.item(), -metric.item())
+
+    def test_invalid_grad_scale_raises(self):
+        for bad in (0.0, -1.0, float("inf"), float("nan")):
+            with self.subTest(grad_scale=bad):
+                with self.assertRaises(ValueError):
+                    _metric(grad_scale=bad)
 
 
 if __name__ == "__main__":
